@@ -32,6 +32,10 @@ sudo chown 1000:1000 data       # der Container läuft als UID 1000
 docker compose build
 ```
 
+Ist die eigene UID nicht 1000 (`id -u`), kann der Container den Schlüssel trotz Mount nicht lesen
+(`Permission denied: '/secrets/private.pem'`). Dann UID 1000 gezielt Leserecht geben:
+`setfacl -m u:1000:r secrets/private.pem` (oder `sudo chown 1000 secrets/private.pem`).
+
 Verbindung testen und Banknamen ermitteln:
 
 ```bash
