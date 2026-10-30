@@ -1,0 +1,14 @@
+# Zugangsdaten und lokale Daten niemals committen
+.env
+secrets/
+*.pem
+data/
+*.sqlite3*
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/

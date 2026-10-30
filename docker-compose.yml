@@ -1,0 +1,11 @@
+services:
+  enable-banking:
+    build: .
+    image: enable-banking-sync:latest
+    container_name: enable-banking
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - ./secrets/private.pem:/secrets/private.pem:ro
+    # Standardbefehl ist "run" (periodischer Abruf); siehe README für einmalige Befehle.
