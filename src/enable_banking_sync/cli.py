@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 import os
@@ -12,7 +11,7 @@ import uuid
 from datetime import date
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__
+from . import __version__, export, web
 from .client import ApiError, EnableBankingClient
 from .config import Config, ConfigError
 from .storage import Storage
@@ -112,8 +111,13 @@ def cmd_fetch(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
-    with Storage(cfg.db_path) as storage:
-        run_forever(_client(cfg), storage, cfg)
+    client = _client(cfg)
+    server = web.start_in_background(cfg)
+    try:
+        with Storage(cfg.db_path) as storage:
+            run_forever(client, storage, cfg)
+    finally:
+        server.shutdown()
     return 0
 
 
@@ -141,35 +145,13 @@ def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-EXPORT_COLUMNS = [
-    "account_uid", "status", "booking_date", "value_date", "amount", "currency",
-    "credit_debit", "counterparty", "counterparty_iban", "remittance",
-    "entry_reference", "transaction_id",
-]
-
-
-def write_csv(rows, out) -> None:
-    # Alle Textfelder in Anführungszeichen, damit Kommas/Semikolons im Verwendungszweck
-    # beim Import in Office nicht als Spaltentrenner gelten. Beträge bleiben Zahlen.
-    writer = csv.writer(out, delimiter=";", quoting=csv.QUOTE_NONNUMERIC)
-    writer.writerow(EXPORT_COLUMNS)
-    for r in rows:
-        writer.writerow([r[c] for c in EXPORT_COLUMNS])
-
-
 def cmd_export(cfg: Config, args: argparse.Namespace) -> int:
     with Storage(cfg.db_path) as storage:
-        rows = storage.transactions(args.account)
-    # CSV-Dateien mit BOM, damit Excel UTF-8 (Umlaute) erkennt.
-    encoding = "utf-8-sig" if args.format == "csv" else "utf-8"
+        rows = storage.transactions(args.account, args.date_from, args.date_to)
+    encoding = export.FORMATS[args.format][1]
     out = open(args.output, "w", newline="", encoding=encoding) if args.output else sys.stdout
     try:
-        if args.format == "json":
-            json.dump([json.loads(r["raw"]) | {"account_uid": r["account_uid"]} for r in rows],
-                      out, indent=2, ensure_ascii=False)
-            out.write("\n")
-        else:
-            write_csv(rows, out)
+        export.write(args.format, rows, out)
     finally:
         if out is not sys.stdout:
             out.close()
@@ -177,6 +159,13 @@ def cmd_export(cfg: Config, args: argparse.Namespace) -> int:
 
 
 # --- Einstiegspunkt --------------------------------------------------------
+
+
+def _iso_date(value: str) -> str:
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"kein Datum im Format YYYY-MM-DD: {value!r}") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -204,12 +193,14 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--date-from", help="Startdatum YYYY-MM-DD (Standard: inkrementell)")
     f.add_argument("--date-to", help="Enddatum YYYY-MM-DD")
 
-    sub.add_parser("run", help="Periodischer Abruf (Standard im Container)")
+    sub.add_parser("run", help="Periodischer Abruf und Exportseite (Standard im Container)")
     sub.add_parser("status", help="Session, Konten und letzten Abruf anzeigen")
 
     e = sub.add_parser("export", help="Gespeicherte Umsätze exportieren")
-    e.add_argument("--format", choices=["csv", "json"], default="csv")
+    e.add_argument("--format", choices=list(export.FORMATS), default="csv")
     e.add_argument("--account", help="Nur dieses Konto (UID)")
+    e.add_argument("--date-from", type=_iso_date, help="Startdatum YYYY-MM-DD")
+    e.add_argument("--date-to", type=_iso_date, help="Enddatum YYYY-MM-DD")
     e.add_argument("-o", "--output", help="Zieldatei (Standard: stdout)")
     return p
 

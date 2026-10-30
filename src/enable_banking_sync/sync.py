@@ -13,6 +13,9 @@ from .storage import Storage, now_iso
 
 log = logging.getLogger(__name__)
 
+# Wartezeit im run-Modus, solange noch keine (gültige) Session existiert.
+NO_SESSION_RETRY = 60
+
 
 class NoSessionError(RuntimeError):
     pass
@@ -134,11 +137,20 @@ def run_forever(client: EnableBankingClient, storage: Storage, cfg: Config) -> N
     signal.signal(signal.SIGINT, _handle)
 
     log.info("Starte periodischen Abruf alle %d Sekunden", cfg.fetch_interval)
+    waiting_for_session = False
     while not stop.is_set():
         try:
             sync_all(client, storage, cfg)
+            waiting_for_session = False
         except NoSessionError as exc:
-            log.error("%s", exc)
+            # Ohne Session wird die API nicht angefragt; daher kurz warten, damit der
+            # Abruf direkt nach "authorize" im laufenden Container startet.
+            if not waiting_for_session:
+                log.error("%s", exc)
+                log.info("Prüfe alle %d Sekunden, ob eine Session vorhanden ist", NO_SESSION_RETRY)
+            waiting_for_session = True
+            stop.wait(NO_SESSION_RETRY)
+            continue
         except Exception:
             log.exception("Abruf fehlgeschlagen")
         next_run = datetime.now() + timedelta(seconds=cfg.fetch_interval)

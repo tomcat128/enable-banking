@@ -1,8 +1,10 @@
 # enable-banking-sync
 
 Ruft Kontoumsätze und Salden automatisiert über die [Enable Banking API](https://enablebanking.com/docs/api/reference/)
-ab und speichert sie lokal in einer SQLite-Datenbank. Läuft als Docker-Container und ruft periodisch
-(Standard: alle 6 Stunden) inkrementell neue Umsätze ab.
+ab und speichert sie lokal in einer SQLite-Datenbank. Alles läuft in einem einzigen Docker-Container:
+Er ruft periodisch (Standard: alle 6 Stunden) inkrementell neue Umsätze ab und stellt eine Webseite
+bereit, über die sich die Umsätze als CSV, JSON oder XML exportieren lassen. Die Datenbank legt die
+Anwendung beim ersten Start selbst im Datenverzeichnis an.
 
 ## Funktionsweise
 
@@ -17,6 +19,7 @@ ab und speichert sie lokal in einer SQLite-Datenbank. Läuft als Docker-Containe
 3. **Speicherung:** Umsätze werden über `entry_reference` / `transaction_id` (Fallback: Hash der
    Umsatzdaten) dedupliziert. Vorgemerkte Umsätze (`PDNG`) werden bei jedem Abruf ersetzt. Die
    Original-JSON-Antwort jedes Umsatzes bleibt in der Spalte `raw` erhalten.
+4. **Export:** Die Exportseite (Port 8080, mit Token geschützt) liest direkt aus der Datenbank.
 
 Die Authentifizierung gegenüber der API erfolgt per RS256-signiertem JWT mit dem privaten Schlüssel der
 Enable-Banking-Anwendung.
@@ -29,31 +32,38 @@ mkdir -p secrets data
 cp /pfad/zu/<application-id>.pem secrets/private.pem
 chmod 600 secrets/private.pem
 sudo chown 1000:1000 data       # der Container läuft als UID 1000
-docker compose build
+docker compose up -d --build
 ```
+
+Datenverzeichnis und Schlüssel werden von außen eingebunden. Ohne weitere Angaben sind das `./data` und
+`./secrets/private.pem`; andere Host-Pfade lassen sich in `.env` über `EB_DATA_PATH` und `EB_KEY_PATH`
+festlegen.
 
 Ist die eigene UID nicht 1000 (`id -u`), kann der Container den Schlüssel trotz Mount nicht lesen
 (`Permission denied: '/secrets/private.pem'`). Dann UID 1000 gezielt Leserecht geben:
 `setfacl -m u:1000:r secrets/private.pem` (oder `sudo chown 1000 secrets/private.pem`).
 
-Verbindung testen und Banknamen ermitteln:
+Alle weiteren Befehle laufen per `docker compose exec` im bereits laufenden Container. Verbindung
+testen und Banknamen ermitteln:
 
 ```bash
-docker compose run --rm enable-banking info
-docker compose run --rm enable-banking banks --country DE --search sparkasse
+docker compose exec enable-banking enable-banking info
+docker compose exec enable-banking enable-banking banks --country DE --search sparkasse
 ```
 
-Den exakten Banknamen in `.env` als `EB_ASPSP_NAME` eintragen.
+Den exakten Banknamen in `.env` als `EB_ASPSP_NAME` eintragen und den Container mit
+`docker compose up -d` neu erstellen, damit er die Änderung übernimmt.
 
 ## Konto autorisieren
 
 ```bash
-docker compose run --rm enable-banking authorize
+docker compose exec enable-banking enable-banking authorize
 ```
 
 Die ausgegebene URL im Browser öffnen, bei der Bank anmelden und freigeben. Danach die komplette URL aus
 der Adresszeile (die Seite der Redirect-URL muss dafür nicht erreichbar sein) in die Konsole einfügen.
-Alternativ: `authorize --code "<redirect-url-oder-code>"`.
+Alternativ: `authorize --code "<redirect-url-oder-code>"`. Solange keine Session existiert, prüft der
+Container jede Minute erneut und startet den ersten Abruf direkt nach der Autorisierung.
 
 Die Zustimmung ist je nach Bank bis zu 90/180 Tage gültig (`EB_ACCESS_DAYS`). Sieben Tage vor Ablauf
 erscheinen Warnungen im Log; danach `authorize` erneut ausführen.
@@ -65,13 +75,41 @@ der Abruf inkrementell weiterläuft und keine Umsätze doppelt gespeichert werde
 ## Betrieb
 
 ```bash
-docker compose up -d                                   # periodischer Abruf
-docker compose logs -f                                 # Logs ansehen
-docker compose run --rm enable-banking fetch           # sofortiger Abruf
-docker compose run --rm enable-banking fetch --date-from 2026-01-01
-docker compose run --rm enable-banking status          # Session, Konten, Salden, letzter Abruf
-docker compose run --rm enable-banking export --format csv -o /data/umsaetze.csv
+docker compose up -d                                               # Abruf + Exportseite
+docker compose logs -f                                             # Logs ansehen
+docker compose exec enable-banking enable-banking fetch            # sofortiger Abruf
+docker compose exec enable-banking enable-banking fetch --date-from 2026-01-01
+docker compose exec enable-banking enable-banking status           # Session, Konten, Salden, letzter Abruf
+docker compose exec enable-banking enable-banking export --format xml -o /data/umsaetze.xml
 ```
+
+## Exportseite
+
+Unter `http://<server>:8080/` lassen sich Konto, Zeitraum und Format (CSV, JSON, XML) wählen. Der
+Export ist auch direkt abrufbar, z. B. für Skripte:
+
+```bash
+curl -H "Authorization: Bearer $EB_WEB_TOKEN" -o umsaetze.csv \
+  'http://localhost:8080/export?format=csv&account=<uid>&date_from=2026-01-01&date_to=2026-06-30'
+```
+
+Alle Parameter sind optional (Standard: CSV, alle Konten, gesamter Zeitraum).
+
+- **CSV:** Semikolon als Trennzeichen, Textfelder in Anführungszeichen, UTF-8 mit BOM (für Excel)
+- **JSON:** die Original-Antwort der Bank je Umsatz, ergänzt um `account_uid`
+- **XML:** ein `<transaction>`-Element je Umsatz mit denselben Feldern wie die CSV; leere Felder entfallen
+
+### Zugriffsschutz
+
+Die Seite ist im Netzwerk erreichbar und wird durch das Token aus `EB_WEB_TOKEN` geschützt (erzeugen z. B.
+mit `openssl rand -hex 32`). Ist kein Token gesetzt, lehnt die Seite jeden Zugriff ab.
+
+- **Skripte und andere Anwendungen** senden den Header `Authorization: Bearer <token>`.
+- **Browser** können beim Aufruf einer Seite keine eigenen Header mitsenden. Sie zeigen stattdessen
+  einen Anmeldedialog: Benutzername beliebig, als Passwort das Token.
+
+Die Verbindung ist unverschlüsseltes HTTP. Für Zugriffe über fremde Netze gehört ein Reverse Proxy mit
+HTTPS davor. Soll die Seite nur vom Server selbst erreichbar sein, `EB_WEB_BIND=127.0.0.1` setzen.
 
 ## Konfiguration
 
@@ -90,6 +128,17 @@ docker compose run --rm enable-banking export --format csv -o /data/umsaetze.csv
 | `EB_DATA_DIR` | `/data` | Ablageort der Datenbank `banking.sqlite3` |
 | `EB_API_BASE` | `https://api.enablebanking.com` | API-Basis-URL |
 | `EB_LOG_LEVEL` | `INFO` | Log-Level |
+| `EB_WEB_TOKEN` | – | Zugriffstoken der Exportseite; ohne Angabe ist die Seite gesperrt |
+| `EB_WEB_PORT` | `8080` | Port der Exportseite im Container |
+
+Nur für `docker compose` (Host-Seite):
+
+| Variable | Standard | Beschreibung |
+|---|---|---|
+| `EB_DATA_PATH` | `./data` | Host-Verzeichnis für die Datenbank |
+| `EB_KEY_PATH` | `./secrets/private.pem` | Host-Pfad des privaten Schlüssels |
+| `EB_WEB_BIND` | `0.0.0.0` | Netzwerkadresse der Exportseite auf dem Host |
+| `EB_WEB_HOST_PORT` | `8080` | Port der Exportseite auf dem Host |
 
 Hinweis: Banken erlauben ohne aktive Nutzerinteraktion (PSD2) häufig nur 4 Abrufe pro Tag und Konto.
 

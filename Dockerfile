@@ -18,6 +18,7 @@ USER app
 ENV EB_DATA_DIR=/data \
     EB_PRIVATE_KEY_PATH=/secrets/private.pem
 VOLUME ["/data"]
+EXPOSE 8080
 
 ENTRYPOINT ["enable-banking"]
 CMD ["run"]

@@ -1,7 +1,8 @@
 import csv
+import xml.etree.ElementTree as ET
 import io
 
-from enable_banking_sync.cli import EXPORT_COLUMNS, write_csv
+from enable_banking_sync.export import EXPORT_COLUMNS, write_csv, write_xml
 from enable_banking_sync.storage import Storage
 
 
@@ -30,3 +31,25 @@ def test_csv_quotes_text_with_commas(tmp_path):
     record = dict(zip(header, row))
     assert record["counterparty"] == "Müller, Hans"
     assert record["remittance"] == 'Rücklagen, Steuern; "NK"'
+
+
+def test_xml_contains_columns_and_escapes(tmp_path):
+    tx = {
+        "transaction_amount": {"amount": "5.00", "currency": "EUR"},
+        "credit_debit_indicator": "CRDT",
+        "status": "BOOK",
+        "booking_date": "2026-08-03",
+        "debtor": {"name": "A & B <GmbH>"},
+        "entry_reference": "r1",
+    }
+    with Storage(tmp_path / "db.sqlite3") as s:
+        s.store_transactions("acc", [tx])
+        rows = s.transactions("acc")
+    out = io.StringIO()
+    write_xml(rows, out)
+
+    root = ET.fromstring(out.getvalue())
+    [elem] = root.findall("transaction")
+    assert elem.findtext("counterparty") == "A & B <GmbH>"
+    assert elem.findtext("amount") == "5.0"
+    assert elem.find("value_date") is None  # leere Felder werden weggelassen

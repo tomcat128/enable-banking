@@ -5,7 +5,13 @@ services:
     container_name: enable-banking
     restart: unless-stopped
     env_file: .env
+    ports:
+      # Exportseite; Zugriff nur mit EB_WEB_TOKEN (siehe .env).
+      - "${EB_WEB_BIND:-0.0.0.0}:${EB_WEB_HOST_PORT:-8080}:8080"
     volumes:
-      - ./data:/data
-      - ./secrets/private.pem:/secrets/private.pem:ro
-    # Standardbefehl ist "run" (periodischer Abruf); siehe README für einmalige Befehle.
+      # Datenverzeichnis (SQLite-Datenbank wird beim ersten Start angelegt)
+      - ${EB_DATA_PATH:-./data}:/data
+      # Privater Schlüssel der Enable-Banking-Anwendung
+      - ${EB_KEY_PATH:-./secrets/private.pem}:/secrets/private.pem:ro
+    # Standardbefehl ist "run" (periodischer Abruf + Exportseite).
+    # Einmalige Befehle im laufenden Container: docker compose exec enable-banking enable-banking <befehl>

@@ -322,13 +322,27 @@ class Storage:
                     inserted += 1
         return received, inserted
 
-    def transactions(self, account_uid: str | None = None) -> list[sqlite3.Row]:
-        sql = "SELECT * FROM transactions"
-        params: tuple = ()
+    def transactions(
+        self,
+        account_uid: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[sqlite3.Row]:
+        day = "COALESCE(booking_date, transaction_date, value_date)"
+        where, params = [], []
         if account_uid:
-            sql += " WHERE account_uid = ?"
-            params = (account_uid,)
-        sql += " ORDER BY COALESCE(booking_date, transaction_date, value_date), tx_key"
+            where.append("account_uid = ?")
+            params.append(account_uid)
+        if date_from:
+            where.append(f"{day} >= ?")
+            params.append(date_from)
+        if date_to:
+            where.append(f"{day} <= ?")
+            params.append(date_to)
+        sql = "SELECT * FROM transactions"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY {day}, tx_key"
         return self.conn.execute(sql, params).fetchall()
 
     def count_transactions(self, account_uid: str) -> int:

@@ -44,6 +44,9 @@ class Config:
     fetch_interval: int
     initial_days: int
     overlap_days: int
+    web_host: str = "0.0.0.0"
+    web_port: int = 8080
+    web_token: str | None = None
 
     @property
     def db_path(self) -> Path:
@@ -64,6 +67,9 @@ class Config:
             fetch_interval=_env_int("EB_FETCH_INTERVAL_SECONDS", 6 * 3600),
             initial_days=_env_int("EB_INITIAL_DAYS", 90),
             overlap_days=_env_int("EB_OVERLAP_DAYS", 10),
+            web_host=_env("EB_WEB_HOST", "0.0.0.0"),
+            web_port=_env_int("EB_WEB_PORT", 8080),
+            web_token=_env("EB_WEB_TOKEN"),
         )
 
     def read_private_key(self) -> str:
