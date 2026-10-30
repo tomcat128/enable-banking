@@ -58,6 +58,10 @@ Alternativ: `authorize --code "<redirect-url-oder-code>"`.
 Die Zustimmung ist je nach Bank bis zu 90/180 Tage gültig (`EB_ACCESS_DAYS`). Sieben Tage vor Ablauf
 erscheinen Warnungen im Log; danach `authorize` erneut ausführen.
 
+Bei jeder Autorisierung vergibt die API neue Konto-UIDs. Bereits gespeicherte Umsätze, Salden und
+Abrufprotokolle werden anhand des `identification_hash` dem Konto der neuen Session zugeordnet, sodass
+der Abruf inkrementell weiterläuft und keine Umsätze doppelt gespeichert werden.
+
 ## Betrieb
 
 ```bash

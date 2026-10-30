@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     iban         TEXT,
     name         TEXT,
     currency     TEXT,
+    identification_hash TEXT,
     raw          TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
@@ -138,6 +139,17 @@ class Storage:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(accounts)")}
+        if "identification_hash" not in columns:
+            with self.conn:
+                self.conn.execute("ALTER TABLE accounts ADD COLUMN identification_hash TEXT")
+                # Bestehende Konten aus der gespeicherten API-Antwort nachtragen.
+                self.conn.execute(
+                    "UPDATE accounts SET identification_hash = json_extract(raw, '$.identification_hash')"
+                )
 
     def close(self) -> None:
         self.conn.close()
@@ -175,22 +187,60 @@ class Storage:
     def save_account(self, session_id: str, acc: dict) -> None:
         if isinstance(acc, str):  # ältere API-Versionen liefern nur die UID
             acc = {"uid": acc}
+        id_hash = acc.get("identification_hash")
         self.conn.execute(
-            """INSERT INTO accounts (uid, session_id, iban, name, currency, raw, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO accounts
+                 (uid, session_id, iban, name, currency, identification_hash, raw, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(uid) DO UPDATE SET
                  session_id = excluded.session_id, iban = excluded.iban, name = excluded.name,
-                 currency = excluded.currency, raw = excluded.raw, updated_at = excluded.updated_at""",
+                 currency = excluded.currency, identification_hash = excluded.identification_hash,
+                 raw = excluded.raw, updated_at = excluded.updated_at""",
             (
                 acc["uid"],
                 session_id,
                 (acc.get("account_id") or {}).get("iban"),
                 acc.get("name"),
                 acc.get("currency"),
+                id_hash,
                 _canonical(acc),
                 now_iso(),
             ),
         )
+        if id_hash:
+            self._adopt_previous_accounts(acc["uid"], id_hash)
+
+    def _adopt_previous_accounts(self, uid: str, id_hash: str) -> None:
+        """Daten früherer Sessions desselben Kontos auf die neue UID umhängen.
+
+        Die UID eines Kontos gilt nur für eine Session; nach erneuter Autorisierung vergibt
+        die API eine neue. ``identification_hash`` bleibt dagegen gleich. Ohne Umhängen
+        würde der Abruf für die neue UID wieder bei EB_INITIAL_DAYS beginnen und alle
+        Umsätze ein zweites Mal speichern.
+        """
+        old_uids = [
+            r["uid"]
+            for r in self.conn.execute(
+                "SELECT uid FROM accounts WHERE identification_hash = ? AND uid != ?",
+                (id_hash, uid),
+            )
+        ]
+        for old in old_uids:
+            # Vormerkungen werden beim nächsten Abruf ohnehin neu geliefert.
+            self.conn.execute(
+                "DELETE FROM transactions WHERE account_uid = ? AND status = 'PDNG'", (old,)
+            )
+            # Bereits unter der neuen UID vorhandene Umsätze haben Vorrang.
+            self.conn.execute(
+                """UPDATE OR IGNORE transactions SET account_uid = ? WHERE account_uid = ?""",
+                (uid, old),
+            )
+            self.conn.execute("DELETE FROM transactions WHERE account_uid = ?", (old,))
+            for table in ("balances", "fetch_runs"):
+                self.conn.execute(
+                    f"UPDATE {table} SET account_uid = ? WHERE account_uid = ?", (uid, old)
+                )
+            self.conn.execute("DELETE FROM accounts WHERE uid = ?", (old,))
 
     def active_session(self) -> sqlite3.Row | None:
         return self.conn.execute(
