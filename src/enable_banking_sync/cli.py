@@ -148,20 +148,28 @@ EXPORT_COLUMNS = [
 ]
 
 
+def write_csv(rows, out) -> None:
+    # Alle Textfelder in Anführungszeichen, damit Kommas/Semikolons im Verwendungszweck
+    # beim Import in Office nicht als Spaltentrenner gelten. Beträge bleiben Zahlen.
+    writer = csv.writer(out, delimiter=";", quoting=csv.QUOTE_NONNUMERIC)
+    writer.writerow(EXPORT_COLUMNS)
+    for r in rows:
+        writer.writerow([r[c] for c in EXPORT_COLUMNS])
+
+
 def cmd_export(cfg: Config, args: argparse.Namespace) -> int:
     with Storage(cfg.db_path) as storage:
         rows = storage.transactions(args.account)
-    out = open(args.output, "w", newline="", encoding="utf-8") if args.output else sys.stdout
+    # CSV-Dateien mit BOM, damit Excel UTF-8 (Umlaute) erkennt.
+    encoding = "utf-8-sig" if args.format == "csv" else "utf-8"
+    out = open(args.output, "w", newline="", encoding=encoding) if args.output else sys.stdout
     try:
         if args.format == "json":
             json.dump([json.loads(r["raw"]) | {"account_uid": r["account_uid"]} for r in rows],
                       out, indent=2, ensure_ascii=False)
             out.write("\n")
         else:
-            writer = csv.writer(out, delimiter=";")
-            writer.writerow(EXPORT_COLUMNS)
-            for r in rows:
-                writer.writerow([r[c] for c in EXPORT_COLUMNS])
+            write_csv(rows, out)
     finally:
         if out is not sys.stdout:
             out.close()
