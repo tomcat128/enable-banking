@@ -2,6 +2,7 @@ import base64
 import http.client
 import json
 import threading
+from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -13,23 +14,25 @@ from enable_banking_sync.config import Config
 from enable_banking_sync.storage import Storage
 from enable_banking_sync.web import make_server
 
-TOKEN = "t0ken"
+LOGIN = {"web_user": "tomek", "web_password": "geheim"}
+EXPORT_AUTH = {"export_user": "skript", "export_password": "s3cret"}
 
 
-def _cfg(tmp_path: Path, token=None) -> Config:
-    return Config(
+def _cfg(tmp_path: Path, **overrides) -> Config:
+    values = dict(
         application_id=None, private_key_path=tmp_path / "missing.pem", api_base="http://x",
         redirect_url=None, aspsp_name=None, aspsp_country="DE", psu_type="personal",
         access_days=180, data_dir=tmp_path, fetch_interval=3600, initial_days=90,
-        overlap_days=10, web_host="127.0.0.1", web_port=0, web_token=token,
+        overlap_days=10, web_host="127.0.0.1", web_port=0,
     )
+    return Config(**(values | overrides))
 
 
-def _tx(ref, day):
+def _tx(ref, day, creditor="Laden", amount="1.00", indicator="DBIT"):
     return {
-        "transaction_amount": {"amount": "1.00", "currency": "EUR"},
-        "credit_debit_indicator": "DBIT", "status": "BOOK", "booking_date": day,
-        "creditor": {"name": "Laden"}, "entry_reference": ref,
+        "transaction_amount": {"amount": amount, "currency": "EUR"},
+        "credit_debit_indicator": indicator, "status": "BOOK", "booking_date": day,
+        "creditor": {"name": creditor}, "entry_reference": ref,
     }
 
 
@@ -73,9 +76,11 @@ class Site:
         self.cfg, self.fake, self.sync = cfg, fake, sync
         self.port = server.server_address[1]
 
-    def request(self, method, path, form=None, auth=None):
+    def request(self, method, path, form=None, auth=None, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        headers = {"Authorization": auth} if auth else {}
+        headers = dict(headers or {})
+        if auth:
+            headers["Authorization"] = auth
         body = None
         if form is not None:
             body = urlencode(form)
@@ -101,14 +106,15 @@ def serve(tmp_path, monkeypatch):
     fake = FakeClient()
     monkeypatch.setattr(settings, "make_client", lambda cfg, st: fake)
 
-    def start(token=None, configured=True):
-        cfg = _cfg(tmp_path, token)
+    def start(configured=True, **overrides):
+        cfg = _cfg(tmp_path, **overrides)
         with Storage(cfg.db_path) as s:
             if configured:
                 s.save_settings({"application_id": "app", "private_key": "KEY"})
             s.save_session({"session_id": "s1", "accounts": [
                 {"uid": "u1", "account_id": {"iban": "DE11"}, "name": "Giro"}]})
-            s.store_transactions("u1", [_tx("a", "2026-09-01"), _tx("b", "2026-10-01")])
+            s.store_transactions("u1", [_tx("a", "2026-09-01"),
+                                        _tx("b", "2026-10-01", "Bäckerei Müller", "2.50")])
         sync = FakeSync()
         server = make_server(cfg, sync)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -170,31 +176,301 @@ def test_fetch_triggers_sync(serve):
     assert site.sync.triggered == 1
 
 
-# --- Zugriffsschutz ------------------------------------------------------------
+# --- Umsätze ----------------------------------------------------------------
 
 
-def test_without_token_access_is_open(serve):
+def test_navigation_links_transactions_and_export_pages(serve):
+    body = serve().get("/")[2]
+    assert 'href="/transactions">Umsätze' in body and 'href="/export/links">Export' in body
+
+
+def test_transactions_page_lists_and_filters(serve):
+    site = serve()
+    status, _, body = site.get("/transactions")
+    assert status == 200
+    assert "2 Umsätze" in body and "Bäckerei Müller" in body and "Laden" in body
+    assert "Summe -3,50 EUR" in body
+    assert 'href="/download?format=csv"' in body
+
+    _, _, body = site.get("/transactions?q=b%C3%A4ckerei")
+    assert "1 Umsatz<" in body
+
+    _, _, body = site.get("/transactions?q=M%C3%BCller")
+    assert "1 Umsatz<" in body and "Bäckerei Müller" in body and ">Laden<" not in body
+    assert 'href="/download?q=M%C3%BCller&amp;format=csv"' in body
+
+    _, _, body = site.get("/transactions?date_to=2026-09-15")
+    assert "1 Umsatz<" in body and ">Laden<" in body
+
+
+def test_transactions_page_reports_invalid_date(serve):
+    status, _, body = serve().get("/transactions?date_from=gestern")
+    assert status == 200 and "Ungültiges Datum" in body
+
+
+def test_download_uses_same_filters(serve):
+    _, _, body = serve().get("/download?format=json&q=M%C3%BCller")
+    assert [t["entry_reference"] for t in json.loads(body)] == ["b"]
+
+
+def test_search_treats_wildcards_literally(serve):
+    assert "0 Umsätze" in serve().get("/transactions?q=%25")[2]
+
+
+def _add_recent(site):
+    today = date.today()
+    with Storage(site.cfg.db_path) as s:
+        s.store_transactions("u1", [_tx("heute", today.isoformat(), "Kiosk"),
+                                    _tx("vor4", (today - timedelta(days=4)).isoformat(), "Tankstelle"),
+                                    _tx("vor5", (today - timedelta(days=5)).isoformat(), "Apotheke")])
+
+
+def test_days_limits_to_last_n_days(serve):
+    site = serve()
+    _add_recent(site)
+    _, _, body = site.get("/export?format=json&days=5")
+    assert sorted(t["entry_reference"] for t in json.loads(body)) == ["heute", "vor4"]
+    _, _, body = site.get("/export?format=json&days=1")
+    assert [t["entry_reference"] for t in json.loads(body)] == ["heute"]
+    _, _, body = site.get("/transactions?days=5")
+    assert "2 Umsätze" in body and "Kiosk" in body and "Apotheke" not in body
+    assert 'href="/download?days=5&amp;format=csv"' in body
+
+
+@pytest.mark.parametrize("query, message", [
+    ("days=0", "days muss eine positive ganze Zahl"),
+    ("days=fuenf", "days muss eine positive ganze Zahl"),
+    ("days=5&date_from=2026-01-01", "nicht kombinieren"),
+])
+def test_days_rejects_invalid_values(serve, query, message):
+    site = serve()
+    status, _, body = site.get("/export?" + query)
+    assert status == 400 and message in body
+    assert message in site.get("/transactions?" + query)[2]
+
+
+@pytest.mark.parametrize("account", ["DE11", "de 11", "u1"])
+def test_account_filter_accepts_iban_or_uid(serve, account):
+    _, _, body = serve().get("/export?format=json&" + urlencode({"account": account}))
+    assert len(json.loads(body)) == 2
+
+
+# --- Export-Seite --------------------------------------------------------------
+
+
+def test_export_page_shows_links_for_all_formats(serve):
+    site = serve()
+    status, _, body = site.get("/export/links?days=5&account=DE11")
+    base = f"http://127.0.0.1:{site.port}/export"
+    assert status == 200
+    for fmt in ("csv", "json", "xml"):
+        assert f'value="{base}?account=DE11&amp;days=5&amp;format={fmt}"' in body
+    assert "0 Umsätze, ab " in body
+    assert 'name="days" min="1" value="5"' in body and '<option value="DE11" selected>' in body
+    assert "Ohne Anmeldung abrufbar" in body
+
+
+def test_export_page_shows_examples(serve):
+    site = serve()
+    _, _, body = site.get("/export/links")
+    base = f"http://127.0.0.1:{site.port}/export"
+    assert f"{base}?days=5&amp;format=csv" in body
+    assert f"{base}?account=DE11&amp;days=5&amp;format=csv" in body
+    assert "Vormonat" in body and "date_from=" in body and "format=xml" in body
+    assert f"curl -o umsaetze.csv &#x27;{base}?days=5&amp;format=csv&#x27;" in body
+    assert "<code>days</code>" in body  # Parametertabelle
+
+
+def test_export_page_requires_login(serve):
+    assert serve(**LOGIN).get("/export/links")[0] == 303
+
+
+# --- Login -------------------------------------------------------------------
+
+
+def _login(site, user="tomek", password="geheim", next_="/"):
+    return site.post("/login", {"user": user, "password": password, "next": next_})
+
+
+def _cookie(headers):
+    return {"Cookie": headers["Set-Cookie"].split(";")[0]}
+
+
+def test_without_login_configured_everything_is_open(serve):
     site = serve()
     assert site.get("/")[0] == 200
+    assert site.get("/transactions")[0] == 200
+    assert site.get("/login")[1]["Location"] == "/"
+
+
+@pytest.mark.parametrize("overrides", [{"web_user": "tomek"}, {"web_password": "geheim"}])
+def test_login_needs_user_and_password(serve, overrides):
+    assert serve(**overrides).get("/")[0] == 200
+
+
+def test_login_redirects_to_login_page(serve):
+    site = serve(**LOGIN)
+    status, headers, _ = site.get("/transactions?q=x")
+    assert status == 303 and headers["Location"] == "/login?next=%2Ftransactions%3Fq%3Dx"
+    status, headers, _ = site.post("/fetch", {})
+    assert status == 303 and headers["Location"] == "/login?next=%2F"
+    assert site.sync.triggered == 0
+    _, _, body = site.get("/login?next=%2Ftransactions%3Fq%3Dx")
+    assert 'name="next" value="/transactions?q=x"' in body and 'href="/settings"' not in body
+
+
+def test_legal_pages_stay_public_with_login(serve):
+    site = serve(**LOGIN)
+    assert site.get("/privacy")[0] == 200
+    assert site.get("/terms.html")[0] == 200
+
+
+@pytest.mark.parametrize("user, password", [("tomek", "falsch"), ("falsch", "geheim"), ("", "")])
+def test_login_rejects_wrong_credentials(serve, user, password):
+    status, headers, body = _login(serve(**LOGIN), user, password)
+    assert status == 200 and "Benutzer oder Passwort ist falsch" in body
+    assert "Set-Cookie" not in headers
+
+
+def test_login_sets_cookie_and_returns_to_target(serve):
+    site = serve(**LOGIN)
+    status, headers, _ = _login(site, next_="/transactions?q=x")
+    assert status == 303 and headers["Location"] == "/transactions?q=x"
+    assert "HttpOnly" in headers["Set-Cookie"] and "SameSite=Lax" in headers["Set-Cookie"]
+    cookie = _cookie(headers)
+    status, _, body = site.get("/", headers=cookie)
+    assert status == 200 and 'action="/logout"' in body
+
+    status, headers, _ = site.post("/logout", {})
+    assert status == 303 and headers["Location"] == "/login?msg=logout"
+    assert "Max-Age=0" in headers["Set-Cookie"]
+
+
+@pytest.mark.parametrize("target", ["https://evil.example/", "//evil.example/", "/\\evil.example", "/x\r\nX: y"])
+def test_login_ignores_foreign_targets(serve, target):
+    status, headers, _ = _login(serve(**LOGIN), next_=target)
+    assert status == 303 and headers["Location"] == "/"
+
+
+def test_login_rejects_tampered_cookie(serve):
+    site = serve(**LOGIN)
+    _, headers, _ = _login(site)
+    cookie = _cookie(headers)["Cookie"]
+    expires, _, signature = cookie.partition("=")[2].partition(".")
+    for forged in (f"{int(expires) + 999}.{signature}", f"{expires}.{signature[:-1]}0", "kaputt", "1.abc"):
+        assert site.get("/", headers={"Cookie": f"eb_session={forged}"})[0] == 303
+
+
+def test_password_change_invalidates_sessions(serve):
+    site = serve(**LOGIN)
+    cookie = _cookie(_login(site)[1])
+    assert site.get("/", headers=cookie)[0] == 200
+    other = serve(web_user="tomek", web_password="neu")  # gleiche Datenbank, neues Passwort
+    assert other.get("/", headers=cookie)[0] == 303
+
+
+# --- Export-Pfad -------------------------------------------------------------
+
+
+def test_export_is_free_without_export_credentials_even_with_login(serve):
+    site = serve(**LOGIN)
     assert site.get("/export")[0] == 200
+    assert site.get("/download")[0] == 303  # Download der Oberfläche braucht den Login
 
 
-@pytest.mark.parametrize("auth", [None, "Bearer falsch", "Bearer ", _basic("x:falsch"), "Token t0ken"])
-def test_rejects_missing_or_wrong_token(serve, auth):
-    status, headers, _ = serve(token=TOKEN).get("/export", auth=auth)
+@pytest.mark.parametrize("overrides", [{"export_user": "skript"}, {"export_password": "s3cret"}])
+def test_export_needs_user_and_password_for_protection(serve, overrides):
+    assert serve(**overrides).get("/export")[0] == 200
+
+
+@pytest.mark.parametrize("auth", [None, _basic("skript:falsch"), _basic("falsch:s3cret"), "Bearer s3cret",
+                                  "Basic ###"])
+def test_export_rejects_missing_or_wrong_credentials(serve, auth):
+    status, headers, _ = serve(**EXPORT_AUTH).get("/export", auth=auth)
     assert status == 401
     assert headers["WWW-Authenticate"].startswith("Basic ")
 
 
-@pytest.mark.parametrize("auth", [f"Bearer {TOKEN}", f"bearer {TOKEN}", _basic(f"egal:{TOKEN}")])
-def test_accepts_token_as_bearer_or_basic_password(serve, auth):
-    assert serve(token=TOKEN).get("/export", auth=auth)[0] == 200
+def test_export_accepts_basic_auth(serve):
+    site = serve(**EXPORT_AUTH)
+    assert site.get("/export?format=json", auth=_basic("skript:s3cret"))[0] == 200
+    assert site.get("/download")[0] == 200  # ohne Login frei, unabhängig vom Export-Schutz
 
 
-def test_legal_pages_are_public_even_with_token(serve):
-    site = serve(token=TOKEN)
-    assert site.get("/privacy")[0] == 200
-    assert site.get("/terms.html")[0] == 200
+def test_export_can_be_disabled(serve):
+    site = serve(export_enabled=False)
+    assert site.get("/export")[0] == 404
+    assert site.get("/download")[0] == 200
+    body = site.get("/export/links")[2]
+    assert "abgeschaltet" in body
+    assert f'value="http://127.0.0.1:{site.port}/download?format=csv"' in body
+
+
+def test_export_page_describes_basic_auth(serve):
+    body = serve(**EXPORT_AUTH).get("/export/links")[2]
+    assert "Geschützt per Basic Auth" in body
+    assert "curl -u BENUTZER:PASSWORT" in body and "s3cret" not in body
+
+
+# --- Abrufsperre & Mail ------------------------------------------------------
+
+
+def _set_block(site):
+    from enable_banking_sync.sync import set_block
+    with Storage(site.cfg.db_path) as s:
+        set_block(s, "Die Bank verlangt eine erneute Anmeldung (EXPIRED_SESSION).", "Benachrichtigung gesendet.")
+
+
+def test_index_shows_block_and_resume_clears_it(serve):
+    site = serve()
+    _set_block(site)
+    _, _, body = site.get("/")
+    assert "Abruf gestoppt" in body and "EXPIRED_SESSION" in body and 'action="/fetch/resume"' in body
+    assert 'action="/fetch"' not in body
+
+    status, headers, _ = site.post("/fetch/resume", {})
+    assert status == 303 and headers["Location"] == "/?msg=resumed"
+    assert site.sync.triggered == 1
+    assert "Abruf gestoppt" not in site.get("/")[2]
+
+
+def test_new_connection_clears_block(serve):
+    site = serve()
+    _set_block(site)
+    site.post("/callback", {"url": "https://x/callback?code=good"})
+    assert "Abruf gestoppt" not in site.get("/")[2]
+
+
+def test_mail_card_without_configuration(serve):
+    _, _, body = serve().get("/settings")
+    assert "Mailversand ist nicht eingerichtet" in body and 'action="/settings/mail"' not in body
+
+
+MAIL = dict(smtp_host="smtp.example.org", smtp_user="bot@example.org", smtp_password="pw",
+            alert_email=("notfall@example.org",))
+
+
+def test_send_test_mail(serve, monkeypatch):
+    from enable_banking_sync import mail
+    sent = []
+    monkeypatch.setattr(mail, "send", lambda cfg, subject, body: sent.append(subject) or "notfall@example.org")
+    site = serve(**MAIL)
+    _, _, body = site.get("/settings")
+    assert "notfall@example.org" in body and "smtp.example.org:587 (starttls)" in body and "pw<" not in body
+    status, _, body = site.post("/settings/mail", {})
+    assert status == 200 and "Test-Mail an notfall@example.org gesendet" in body
+    assert sent == ["Enable Banking: Test-Nachricht"]
+
+
+def test_test_mail_shows_error(serve, monkeypatch):
+    from enable_banking_sync import mail
+
+    def fail(*args):
+        raise OSError("Connection refused")
+
+    monkeypatch.setattr(mail, "send", fail)
+    _, _, body = serve(**MAIL).post("/settings/mail", {})
+    assert "Die Test-Mail konnte nicht gesendet werden: Connection refused" in body
 
 
 # --- Einstellungen -----------------------------------------------------------

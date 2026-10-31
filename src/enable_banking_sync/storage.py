@@ -350,22 +350,32 @@ class Storage:
         account_uid: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        *,
+        search: str | None = None,
+        newest_first: bool = False,
     ) -> list[sqlite3.Row]:
+        """Umsätze nach Filter; account_uid darf auch eine IBAN sein (bleibt beim Neuverbinden gleich)."""
         day = "COALESCE(booking_date, transaction_date, value_date)"
         where, params = [], []
         if account_uid:
-            where.append("account_uid = ?")
-            params.append(account_uid)
+            where.append("(account_uid = ? OR account_uid IN "
+                         "(SELECT uid FROM accounts WHERE UPPER(REPLACE(iban, ' ', '')) = ?))")
+            params += [account_uid, account_uid.replace(" ", "").upper()]
         if date_from:
             where.append(f"{day} >= ?")
             params.append(date_from)
         if date_to:
             where.append(f"{day} <= ?")
             params.append(date_to)
+        if search:
+            # Teilstring in Gegenpartei oder Verwendungszweck; % und _ gelten nicht als Platzhalter.
+            pattern = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            where.append("(counterparty LIKE ? ESCAPE '\\' OR remittance LIKE ? ESCAPE '\\')")
+            params += [pattern, pattern]
         sql = "SELECT * FROM transactions"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += f" ORDER BY {day}, tx_key"
+        sql += f" ORDER BY {day} {'DESC' if newest_first else 'ASC'}, tx_key"
         return self.conn.execute(sql, params).fetchall()
 
     def recent_transactions(self, limit: int = 50) -> list[sqlite3.Row]:

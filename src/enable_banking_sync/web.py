@@ -3,40 +3,52 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import html
 import io
 import json
 import logging
+import secrets
 import threading
 import time
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
-from . import export, settings
+from . import export, mail, settings
 from .client import ApiError
 from .config import Config, ConfigError
 from .storage import Storage
-from .sync import SyncService, _parse_ts
+from .sync import SyncService, _parse_ts, clear_block, get_block
 
 log = logging.getLogger(__name__)
 
 MAX_BODY = 200_000
 BANK_CACHE_SECONDS = 3600
 PENDING_SECONDS = 3600
+SESSION_COOKIE = "eb_session"
+SESSION_SECONDS = 30 * 86400
+DISPLAY_LIMIT = 500
+FILTERS = ("account", "date_from", "date_to", "days", "q")
+FORMATS = ("csv", "json", "xml")
+MONTHS = ("Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober",
+          "November", "Dezember")
 
 MESSAGES = {
     "saved": "Einstellungen gespeichert.",
     "connected": "Bank verbunden. Der erste Abruf läuft.",
     "fetch": "Abruf gestartet.",
     "setup": "Bitte zuerst Application ID und privaten Schlüssel eintragen.",
+    "logout": "Abgemeldet.",
+    "resumed": "Automatischer Abruf freigegeben. Der Abruf läuft.",
 }
 
-NAV = (("/", "Übersicht"), ("/connect", "Bank verbinden"), ("/settings", "Einstellungen"))
+NAV = (("/", "Übersicht"), ("/transactions", "Umsätze"), ("/export/links", "Export"),
+       ("/connect", "Bank verbinden"), ("/settings", "Einstellungen"))
 
 CSS = """
 :root { --text: #1f2328; --muted: #59636e; --bg: #f6f8fa; --card: #ffffff; --line: #d1d9e0;
@@ -52,6 +64,15 @@ body { font-family: system-ui, sans-serif; line-height: 1.5; color: var(--text);
        max-width: 64rem; margin: 0 auto; padding: 1rem; }
 header { display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; align-items: baseline; margin-bottom: 1rem; }
 header nav { display: flex; flex-wrap: wrap; gap: 1rem; }
+header form { margin-left: auto; }
+header button { margin: 0; padding: .2rem .8rem; }
+.button.secondary, button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+.buttons { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+.buttons .button, .buttons button { margin-top: 0; }
+input.url { font-family: ui-monospace, monospace; font-size: .85rem; min-width: 16rem; }
+table.links th, table.links td { vertical-align: middle; }
+td.actions { white-space: nowrap; width: 1%; }
+td.actions .button, td.actions button { margin: 0 0 0 .25rem; padding: .3rem .8rem; }
 a { color: var(--accent); }
 h2 { font-size: 1.1rem; margin: 0 0 .75rem; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.25rem;
@@ -111,8 +132,78 @@ def moment(value: str | datetime | None) -> str:
     return dt.astimezone().strftime("%d.%m.%Y %H:%M") if dt else ""
 
 
-def layout(title: str, content: str, *, notice: str = "", error: str = "", refresh: bool = False) -> str:
-    nav = "".join(f'<a href="{href}">{label}</a>' for href, label in NAV)
+COPY_SCRIPT = """
+<script>
+  document.querySelectorAll('[data-copy]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      var input = document.getElementById(button.dataset.copy);
+      input.select();
+      var done = function () { button.textContent = 'Kopiert'; };
+      if (navigator.clipboard) navigator.clipboard.writeText(input.value).then(done, function () {
+        document.execCommand('copy'); done(); });
+      else { document.execCommand('copy'); done(); }
+    });
+  });
+</script>"""
+
+
+def _is_account(account, value: str) -> bool:
+    return bool(value) and (value == account["uid"] or
+                            value.replace(" ", "").upper() == (account["iban"] or "").replace(" ", "").upper())
+
+
+def effective_from(filters: dict[str, str]) -> str | None:
+    """Startdatum aus date_from oder days (days=1 ist nur heute)."""
+    if filters.get("days"):
+        return (date.today() - timedelta(days=int(filters["days"]) - 1)).isoformat()
+    return filters.get("date_from") or None
+
+
+def describe(filters: dict[str, str]) -> str:
+    """Kurzbeschreibung des Zeitraums für die Anzeige."""
+    start, end = effective_from(filters), filters.get("date_to")
+    if start and end:
+        return f", {day(start)} bis {day(end)}"
+    if start:
+        return f", ab {day(start)}"
+    if end:
+        return f", bis {day(end)}"
+    return ""
+
+
+def totals(rows) -> str:
+    """Einnahmen, Ausgaben und Summe je Währung."""
+    sums: dict[str, list[float]] = {}
+    for r in rows:
+        if r["amount"] is not None:
+            pair = sums.setdefault(r["currency"] or "", [0.0, 0.0])
+            pair[0 if r["amount"] >= 0 else 1] += r["amount"]
+    return "".join(
+        f' · Einnahmen <span class="ok">{money(income, cur)}</span>'
+        f' · Ausgaben <span class="err">{money(spent, cur)}</span>'
+        f" · Summe {money(income + spent, cur)}"
+        for cur, (income, spent) in sorted(sums.items()))
+
+
+def tx_table(rows, labels: dict[str, str] | None = None) -> str:
+    """Umsatztabelle; mit labels zusätzlich eine Spalte für das Konto."""
+    head = "<th>Datum</th>" + ("<th>Konto</th>" if labels else "") + (
+        "<th>Betrag</th><th>Gegenpartei</th><th>Verwendungszweck</th><th></th>")
+    body = "".join(
+        f"<tr><td>{day(r['booking_date'] or r['transaction_date'] or r['value_date'])}</td>"
+        + (f"<td>{esc(labels.get(r['account_uid'], r['account_uid']))}</td>" if labels else "")
+        + f'<td class="num{" neg" if (r["amount"] or 0) < 0 else ""}">{money(r["amount"], r["currency"])}</td>'
+        f"<td>{esc(r['counterparty'])}</td><td>{esc(r['remittance'])}</td>"
+        f"<td>{'vorgemerkt' if r['status'] == 'PDNG' else ''}</td></tr>"
+        for r in rows)
+    return f'<div class="table"><table><tr>{head}</tr>{body}</table></div>'
+
+
+def layout(title: str, content: str, *, notice: str = "", error: str = "", refresh: bool = False,
+           nav: bool = True, logout: bool = False) -> str:
+    links = "".join(f'<a href="{href}">{label}</a>' for href, label in NAV) if nav else ""
+    logout_form = ('<form method="post" action="/logout"><button class="secondary">Abmelden</button></form>'
+                   if logout else "")
     return f"""<!doctype html>
 <html lang="de">
 <head>
@@ -124,7 +215,7 @@ def layout(title: str, content: str, *, notice: str = "", error: str = "", refre
 <style>{CSS}</style>
 </head>
 <body>
-<header><strong>Enable Banking</strong><nav>{nav}</nav></header>
+<header><strong>Enable Banking</strong><nav>{links}</nav>{logout_form}</header>
 {f'<p class="notice">{esc(notice)}</p>' if notice else ''}
 {f'<p class="error">{esc(error)}</p>' if error else ''}
 {content}
@@ -132,6 +223,18 @@ def layout(title: str, content: str, *, notice: str = "", error: str = "", refre
 </body>
 </html>
 """
+
+
+def _same(given: str, expected: str | None) -> bool:
+    return expected is not None and hmac.compare_digest(given.encode(), expected.encode())
+
+
+def _safe_next(target: str) -> str:
+    """Nur relative Ziele innerhalb der Anwendung zulassen (kein offener Redirect)."""
+    if (target.startswith("/") and not target.startswith(("//", "/\\"))
+            and not any(ord(c) < 32 for c in target)):
+        return target
+    return "/"
 
 
 class App:
@@ -143,6 +246,39 @@ class App:
         self._lock = threading.Lock()
         self._pending: dict[str, float] = {}  # state -> Startzeit der Autorisierung
         self._banks: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+        self._session_key = self._make_session_key() if cfg.login_required else b""
+
+    # --- Login -------------------------------------------------------------
+
+    def _make_session_key(self) -> bytes:
+        # Das Geheimnis liegt in der Datenbank, damit Anmeldungen einen Neustart überstehen.
+        # Benutzer und Passwort fließen ein: Nach einer Änderung sind alte Anmeldungen ungültig.
+        with Storage(self.cfg.db_path) as storage:
+            secret = storage.settings().get("session_secret")
+            if not secret:
+                secret = secrets.token_hex(32)
+                storage.save_settings({"session_secret": secret})
+        material = f"{self.cfg.web_user}\0{self.cfg.web_password}".encode()
+        return hmac.new(secret.encode(), material, hashlib.sha256).digest()
+
+    def _sign(self, expires: int) -> bytes:
+        return hmac.new(self._session_key, str(expires).encode(), hashlib.sha256).hexdigest().encode()
+
+    def new_session(self) -> str:
+        expires = int(time.time()) + SESSION_SECONDS
+        return f"{expires}.{self._sign(expires).decode()}"
+
+    def valid_session(self, token: str) -> bool:
+        expires, _, signature = token.partition(".")
+        if not expires.isdigit() or int(expires) < time.time():
+            return False
+        return hmac.compare_digest(signature.encode(), self._sign(int(expires)))
+
+    def check_login(self, user: str, password: str) -> bool:
+        return _same(user, self.cfg.web_user) & _same(password, self.cfg.web_password)
+
+    def check_export_auth(self, user: str, password: str) -> bool:
+        return _same(user, self.cfg.export_user) & _same(password, self.cfg.export_password)
 
     def remember_state(self, state: str) -> None:
         with self._lock:
@@ -176,11 +312,18 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "enable-banking"
     sys_version = ""
 
-    # Rechtstexte müssen ohne Token erreichbar sein (z. B. für die Prüfung durch Enable Banking).
-    PUBLIC = {"/privacy", "/privacy.html", "/terms", "/terms.html"}
+    # Ohne Login erreichbar: Anmeldung, Rechtstexte (Enable Banking ruft sie ab) und der
+    # Export-Pfad, der eine eigene Basic-Auth-Prüfung hat.
+    PUBLIC = {"/login", "/logout", "/privacy", "/privacy.html", "/terms", "/terms.html", "/export"}
 
     ROUTES = {
         ("GET", "/"): "index",
+        ("GET", "/login"): "login_page",
+        ("POST", "/login"): "login",
+        ("POST", "/logout"): "logout",
+        ("GET", "/transactions"): "transactions_page",
+        ("GET", "/download"): "download",
+        ("GET", "/export/links"): "export_page",
         ("GET", "/settings"): "settings_page",
         ("POST", "/settings"): "save_settings",
         ("POST", "/settings/test"): "test_connection",
@@ -189,6 +332,8 @@ class Handler(BaseHTTPRequestHandler):
         ("GET", "/callback"): "callback",
         ("POST", "/callback"): "callback_manual",
         ("POST", "/fetch"): "fetch",
+        ("POST", "/fetch/resume"): "resume_fetch",
+        ("POST", "/settings/mail"): "test_mail",
         ("GET", "/export"): "export",
         ("GET", "/privacy"): "privacy",
         ("GET", "/privacy.html"): "privacy",
@@ -213,8 +358,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._text(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Anfrage zu groß")
             body = self.rfile.read(length).decode("utf-8", "replace")
             self.form = {k: v[0] for k, v in parse_qs(body, keep_blank_values=True).items()}
-        if path not in self.PUBLIC and not self._authorized():
-            return
+        if path not in self.PUBLIC and not self._logged_in():
+            target = self.path if self.command == "GET" else "/"
+            return self._redirect("/login?next=" + quote(target, safe=""))
         name = self.ROUTES.get((self.command, path))
         if not name:
             return self._text(HTTPStatus.NOT_FOUND, "Nicht gefunden")
@@ -225,33 +371,50 @@ class Handler(BaseHTTPRequestHandler):
             self._page("Fehler", "", error="Interner Fehler, Details stehen im Log.",
                        status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
-    def _authorized(self) -> bool:
-        """Prüft das optionale Token aus EB_WEB_TOKEN; ohne Token ist alles frei zugänglich.
-
-        Skripte senden es als ``Authorization: Bearer <token>``. Browser können beim Aufruf
-        einer Seite keine eigenen Header setzen; dort wird das Token als Passwort der
-        Basic-Auth-Anmeldung akzeptiert (Benutzername beliebig).
-        """
-        expected = self.app.cfg.web_token
-        if not expected:
+    def _logged_in(self) -> bool:
+        if not self.app.cfg.login_required:
             return True
-        scheme, _, credentials = self.headers.get("Authorization", "").partition(" ")
-        token = ""
-        if scheme.lower() == "bearer":
-            token = credentials.strip()
-        elif scheme.lower() == "basic":
-            try:
-                token = base64.b64decode(credentials).decode().partition(":")[2]
-            except ValueError:
-                pass
-        if token and hmac.compare_digest(token.encode(), expected.encode()):
-            return True
-        self.send_response(HTTPStatus.UNAUTHORIZED)
-        # Löst im Browser den Anmeldedialog aus; Skripte nutzen stattdessen Bearer.
-        self.send_header("WWW-Authenticate", 'Basic realm="enable-banking", charset="UTF-8"')
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        for part in self.headers.get("Cookie", "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == SESSION_COOKIE and self.app.valid_session(value):
+                return True
         return False
+
+    def _cookie(self, value: str, max_age: int) -> dict[str, str]:
+        secure = "; Secure" if self._base_url().startswith("https://") else ""
+        return {"Set-Cookie": f"{SESSION_COOKIE}={value}; Path=/; Max-Age={max_age}; HttpOnly; "
+                              f"SameSite=Lax{secure}"}
+
+    # --- Anmeldung ---------------------------------------------------------
+
+    def login_page(self, *, error: str = "") -> None:
+        if not self.app.cfg.login_required:
+            return self._redirect("/")
+        target = _safe_next(self.params.get("next") or self.form.get("next") or "/")
+        form = f"""
+<form method="post" action="/login">
+  <input type="hidden" name="next" value="{esc(target)}">
+  <label for="user">Benutzer</label>
+  <input id="user" name="user" autocomplete="username" required autofocus>
+  <label for="password">Passwort</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <button>Anmelden</button>
+</form>"""
+        self._page("Anmelden", card("Anmelden", form), error=error, nav=False)
+
+    def login(self) -> None:
+        if not self.app.cfg.login_required:
+            return self._redirect("/")
+        if not self.app.check_login(self.form.get("user", ""), self.form.get("password", "")):
+            log.warning("Fehlgeschlagene Anmeldung von %s", self.address_string())
+            time.sleep(1)  # bremst das Durchprobieren von Passwörtern
+            return self.login_page(error="Benutzer oder Passwort ist falsch.")
+        self._redirect(_safe_next(self.form.get("next") or "/"),
+                       self._cookie(self.app.new_session(), SESSION_SECONDS))
+
+    def logout(self) -> None:
+        target = "/login?msg=logout" if self.app.cfg.login_required else "/"
+        self._redirect(target, self._cookie("", 0))
 
     # --- Hilfen ------------------------------------------------------------
 
@@ -282,9 +445,9 @@ class Handler(BaseHTTPRequestHandler):
                  s.last_run(a["uid"]), s.latest_balances(a["uid"]))
                 for a in (s.accounts(session["session_id"]) if session else [])
             ]
-            all_accounts = [(a, s.count_transactions(a["uid"])) for a in s.accounts()]
             total = s.count_transactions()
-            recent = s.recent_transactions(30)
+            recent = s.recent_transactions(10)
+            block = get_block(s)
 
         parts = []
         if not st.complete:
@@ -293,11 +456,10 @@ class Handler(BaseHTTPRequestHandler):
                 "privaten Schlüssel deiner Enable-Banking-Anwendung ein.</p>"
                 '<a class="button" href="/settings">Zu den Einstellungen</a>')))
         parts.append(self._session_card(session, st))
-        parts.append(self._sync_card(session))
+        parts.append(self._block_card(block) if block else self._sync_card(session))
         if accounts:
             parts.append(self._accounts_card(accounts))
-        parts.append(self._export_card(all_accounts, total))
-        parts.append(self._recent_card(recent))
+        parts.append(self._recent_card(recent, total))
         busy = bool(self.app.sync and self.app.sync.busy)
         self._page("Übersicht", "".join(parts), refresh=busy)
 
@@ -317,6 +479,18 @@ class Handler(BaseHTTPRequestHandler):
             f"<p>Verbunden mit <strong>{esc(session['aspsp_name'])}</strong>"
             f" ({esc(session['aspsp_country'])}).{state}</p>"
             '<a class="button" href="/connect">Neu verbinden</a>'))
+
+    def _block_card(self, block: dict) -> str:
+        since = f" seit {moment(block['since'])}" if block.get("since") else ""
+        return card("Abruf gestoppt", (
+            f'<p class="err"><strong>Die Bank verlangt eine erneute Anmeldung.</strong> Der automatische Abruf '
+            f"ist{since} gestoppt; es werden keine weiteren Versuche unternommen.</p>"
+            f"<p>{esc(block.get('reason'))}</p>"
+            + (f'<p class="muted">{esc(block["mail"])}</p>' if block.get("mail") else "")
+            + '<div class="buttons" style="margin-top:1rem"><a class="button" href="/connect">Bank neu verbinden</a>'
+            '<form method="post" action="/fetch/resume"><button class="secondary">Abruf trotzdem wieder '
+            "freigeben</button></form></div>"
+            '<p class="hint">Nach dem Neuverbinden läuft der Abruf automatisch wieder.</p>'))
 
     def _sync_card(self, session) -> str:
         sync = self.app.sync
@@ -359,40 +533,11 @@ class Handler(BaseHTTPRequestHandler):
             '<div class="table"><table><tr><th>Konto</th><th>Saldo</th><th>Umsätze</th>'
             f"<th>Letzte Buchung</th><th>Letzter Abruf</th></tr>{''.join(rows)}</table></div>"))
 
-    def _export_card(self, all_accounts, total: int) -> str:
-        options = "".join(
-            f'<option value="{esc(a["uid"])}">{esc(a["iban"] or a["uid"])} {esc(a["name"])}'
-            f" ({count} Umsätze)</option>"
-            for a, count in all_accounts)
-        return card("Export", f"""
-<form method="get" action="/export">
-  <div class="inline">
-    <div><label for="account">Konto</label>
-      <select id="account" name="account"><option value="">Alle Konten ({total} Umsätze)</option>{options}</select></div>
-    <div><label for="date_from">Von</label><input type="date" id="date_from" name="date_from"></div>
-    <div><label for="date_to">Bis</label><input type="date" id="date_to" name="date_to"></div>
-  </div>
-  <div class="radios" style="margin-top:.75rem">
-    <label><input type="radio" name="format" value="csv" checked> CSV</label>
-    <label><input type="radio" name="format" value="json"> JSON</label>
-    <label><input type="radio" name="format" value="xml"> XML</label>
-  </div>
-  <button>Herunterladen</button>
-</form>
-<p class="hint">Direkt abrufbar unter <code>/export?format=csv&amp;account=&lt;uid&gt;&amp;date_from=YYYY-MM-DD&amp;date_to=YYYY-MM-DD</code></p>""")
-
-    def _recent_card(self, recent) -> str:
+    def _recent_card(self, recent, total: int) -> str:
         if not recent:
             return card("Letzte Umsätze", '<p class="muted">Noch keine Umsätze gespeichert.</p>')
-        rows = "".join(
-            f"<tr><td>{day(r['booking_date'] or r['transaction_date'] or r['value_date'])}</td>"
-            f'<td class="num{" neg" if (r["amount"] or 0) < 0 else ""}">{money(r["amount"], r["currency"])}</td>'
-            f"<td>{esc(r['counterparty'])}</td><td>{esc(r['remittance'])}</td>"
-            f"<td>{'vorgemerkt' if r['status'] == 'PDNG' else ''}</td></tr>"
-            for r in recent)
-        return card("Letzte Umsätze", (
-            '<div class="table"><table><tr><th>Datum</th><th>Betrag</th><th>Gegenpartei</th>'
-            f"<th>Verwendungszweck</th><th></th></tr>{rows}</table></div>"))
+        return card("Letzte Umsätze", tx_table(recent) + (
+            f'<a class="button" href="/transactions">Alle {total} Umsätze anzeigen und exportieren</a>'))
 
     # --- Einstellungen -----------------------------------------------------
 
@@ -441,7 +586,37 @@ class Handler(BaseHTTPRequestHandler):
 </table></div>
 <form method="post" action="/settings/test"><button>Verbindung testen</button></form>"""
         self._page("Einstellungen",
-                   card("Zugangsdaten", form) + result + card("Control Panel", urls), error=error)
+                   card("Zugangsdaten", form) + result + card("Control Panel", urls)
+                   + self._mail_card(), error=error)
+
+    def _mail_card(self) -> str:
+        cfg = self.app.cfg
+        intro = ("<p>Verlangt die Bank eine erneute Anmeldung, stoppt der automatische Abruf und der "
+                 "Notfallkontakt erhält eine E-Mail.</p>")
+        if not cfg.mail_configured:
+            return card("Benachrichtigung per E-Mail", intro + (
+                '<p class="warn">Der Mailversand ist nicht eingerichtet.</p><p class="hint">In der <code>.env</code> '
+                "mindestens <code>EB_SMTP_HOST</code>, <code>EB_SMTP_USER</code> und <code>EB_SMTP_PASSWORD</code> "
+                "(oder <code>EB_SMTP_FROM</code>) sowie <code>EB_ALERT_EMAIL</code> setzen und den Container neu "
+                "starten.</p>"))
+        rows = (("SMTP-Server", f"{cfg.smtp_host}:{cfg.smtp_port} ({cfg.smtp_security})"),
+                ("Benutzer", cfg.smtp_user or "– (ohne Anmeldung)"),
+                ("Absender", cfg.smtp_from or cfg.smtp_user),
+                ("Notfallkontakt", ", ".join(cfg.alert_email)))
+        table = "".join(f"<tr><th>{label}</th><td>{esc(value)}</td></tr>" for label, value in rows)
+        return card("Benachrichtigung per E-Mail", intro + (
+            f'<div class="table"><table>{table}</table></div>'
+            '<form method="post" action="/settings/mail"><button>Test-Mail senden</button></form>'))
+
+    def test_mail(self) -> None:
+        subject, body = mail.test_message(mail.public_url(self._redirect_url(self._settings())))
+        try:
+            recipients = mail.send(self.app.cfg, subject, body)
+        except mail.MAIL_ERRORS as exc:
+            log.error("Test-Mail fehlgeschlagen: %s", exc)
+            return self.settings_page(error=f"Die Test-Mail konnte nicht gesendet werden: {exc}")
+        log.info("Test-Mail an %s gesendet", recipients)
+        self.settings_page(result=card("Test-Mail", f'<p class="ok">Test-Mail an {esc(recipients)} gesendet.</p>'))
 
     def save_settings(self) -> None:
         values = {k: self.form.get(k, "").strip() for k in settings.FIELDS if k != "private_key"}
@@ -608,6 +783,7 @@ class Handler(BaseHTTPRequestHandler):
                 error=f"Die Verbindung konnte nicht hergestellt werden: {exc}")
         with self._storage() as storage:
             storage.save_session(session)
+            clear_block(storage)  # neue Freigabe der Bank: automatischer Abruf läuft wieder
         log.info("Bank verbunden: %s", (session.get("aspsp") or {}).get("name"))
         if self.app.sync:
             self.app.sync.trigger()
@@ -620,26 +796,230 @@ class Handler(BaseHTTPRequestHandler):
             self.app.sync.trigger()
         self._redirect("/?msg=fetch")
 
+    def resume_fetch(self) -> None:
+        with self._storage() as storage:
+            clear_block(storage)
+        if self.app.sync:
+            self.app.sync.trigger()
+        self._redirect("/?msg=resumed")
+
+    def _filters(self) -> dict[str, str]:
+        """Filter aus der Adresse; wirft ValueError bei ungültigen Angaben."""
+        filters = {name: (self.params.get(name) or "").strip() for name in FILTERS}
+        for name in ("date_from", "date_to"):
+            if filters[name]:
+                try:
+                    filters[name] = date.fromisoformat(filters[name]).isoformat()
+                except ValueError:
+                    raise ValueError(f"Ungültiges Datum für {name}: {filters[name]}") from None
+        if filters["days"]:
+            if not filters["days"].isdigit() or not 1 <= int(filters["days"]) <= 36500:
+                raise ValueError(f"days muss eine positive ganze Zahl sein, nicht {filters['days']!r}.")
+            if filters["date_from"]:
+                raise ValueError("days und date_from lassen sich nicht kombinieren; bitte nur eines angeben.")
+        return filters
+
+    @staticmethod
+    def _rows(storage: Storage, filters: dict[str, str], *, newest_first: bool = False):
+        return storage.transactions(filters["account"] or None, effective_from(filters),
+                                    filters["date_to"] or None, search=filters["q"] or None,
+                                    newest_first=newest_first)
+
+    def _filter_form(self, action: str, filters: dict[str, str], accounts, button: str) -> str:
+        options = "".join(
+            f'<option value="{esc(a["iban"] or a["uid"])}"{" selected" if _is_account(a, filters["account"]) else ""}>'
+            f'{esc(a["iban"] or a["uid"])} {esc(a["name"])} ({n})</option>'
+            for a, n in accounts)
+        return f"""
+<form method="get" action="{action}">
+  <div class="inline">
+    <div><label for="account">Konto</label>
+      <select id="account" name="account"><option value="">Alle Konten</option>{options}</select></div>
+    <div><label for="days">Letzte Tage</label>
+      <input type="number" id="days" name="days" min="1" value="{esc(filters['days'])}" placeholder="z. B. 5"></div>
+    <div><label for="date_from">Von</label>
+      <input type="date" id="date_from" name="date_from" value="{esc(filters['date_from'])}"></div>
+    <div><label for="date_to">Bis</label>
+      <input type="date" id="date_to" name="date_to" value="{esc(filters['date_to'])}"></div>
+    <div><label for="q">Suche</label>
+      <input id="q" name="q" value="{esc(filters['q'])}" placeholder="Gegenpartei, Verwendungszweck"></div>
+  </div>
+  <p class="hint">Entweder „Letzte Tage“ (5 = heute und die 4 Tage davor) oder „Von“ angeben. Alle Felder sind
+    optional.</p>
+  <div class="buttons"><button>{button}</button>
+    <a class="button secondary" href="{action}">Zurücksetzen</a></div>
+</form>"""
+
+    def _filter_accounts(self, storage: Storage, selected: str):
+        # Konten ohne Umsätze (z. B. aus abgelösten Verbindungen) nicht zur Auswahl anbieten.
+        return [(a, n) for a in storage.accounts()
+                if (n := storage.count_transactions(a["uid"])) or _is_account(a, selected)]
+
     def export(self) -> None:
+        """Export-Pfad für Skripte: abschaltbar, optional mit eigener Basic Auth."""
+        cfg = self.app.cfg
+        if not cfg.export_enabled:
+            return self._text(HTTPStatus.NOT_FOUND, "Nicht gefunden")
+        if cfg.export_protected:
+            scheme, _, credentials = self.headers.get("Authorization", "").partition(" ")
+            user = password = ""
+            if scheme.lower() == "basic":
+                try:
+                    user, _, password = base64.b64decode(credentials).decode().partition(":")
+                except ValueError:
+                    pass
+            if not self.app.check_export_auth(user, password):
+                return self._send(HTTPStatus.UNAUTHORIZED, "text/plain; charset=utf-8", b"Anmeldung erforderlich\n",
+                                  {"WWW-Authenticate": 'Basic realm="export", charset="UTF-8"'})
+        self._send_export()
+
+    def download(self) -> None:
+        """Download aus der Oberfläche; geschützt durch den Login der Oberfläche."""
+        self._send_export()
+
+    def _send_export(self) -> None:
         fmt = self.params.get("format") or "csv"
         if fmt not in export.FORMATS:
             return self._text(HTTPStatus.BAD_REQUEST, f"Unbekanntes Format: {fmt}")
-        dates = {}
-        for name in ("date_from", "date_to"):
-            value = (self.params.get(name) or "").strip()
-            try:
-                dates[name] = value and date.fromisoformat(value).isoformat()
-            except ValueError:
-                return self._text(HTTPStatus.BAD_REQUEST, f"Ungültiges Datum für {name}: {value}")
+        try:
+            filters = self._filters()
+        except ValueError as exc:
+            return self._text(HTTPStatus.BAD_REQUEST, str(exc))
         with self._storage() as storage:
-            rows = storage.transactions(self.params.get("account") or None,
-                                        dates["date_from"] or None, dates["date_to"] or None)
+            rows = self._rows(storage, filters)
         content_type, encoding = export.FORMATS[fmt]
         out = io.StringIO(newline="")
         export.write(fmt, rows, out)
         filename = f"umsaetze-{date.today().isoformat()}.{fmt}"
         self._send(HTTPStatus.OK, f"{content_type}; charset=utf-8", out.getvalue().encode(encoding),
                    {"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    # --- Umsätze -----------------------------------------------------------
+
+    def transactions_page(self) -> None:
+        error = ""
+        try:
+            filters = self._filters()
+        except ValueError as exc:
+            filters, error = dict.fromkeys(FILTERS, ""), str(exc)
+        with self._storage() as s:
+            accounts = self._filter_accounts(s, filters["account"])
+            rows = self._rows(s, filters, newest_first=True)
+        labels = {a["uid"]: a["iban"] or a["name"] or a["uid"] for a, _ in accounts}
+        form = self._filter_form("/transactions", filters, accounts, "Anzeigen")
+
+        query = urlencode({k: v for k, v in filters.items() if v})
+        sep = "&amp;" if query else ""
+        downloads = "".join(
+            f'<a class="button secondary" href="/download?{esc(query)}{sep}format={fmt}">{fmt.upper()}</a>'
+            for fmt in FORMATS)
+        count = "1 Umsatz" if len(rows) == 1 else f"{len(rows)} Umsätze"
+        summary = f"<p><strong>{count}</strong>{totals(rows)}</p>"
+        if len(rows) > DISPLAY_LIMIT:
+            summary += (f'<p class="hint">Angezeigt werden die neuesten {DISPLAY_LIMIT}. '
+                        "Der Export enthält alle Umsätze der Auswahl.</p>")
+        listing = (tx_table(rows[:DISPLAY_LIMIT], labels if len(labels) > 1 else None) if rows
+                   else '<p class="muted">Keine Umsätze für diese Auswahl.</p>')
+        result = (summary + f'<div class="buttons" style="margin-bottom:1rem">'
+                  f'<span>Auswahl herunterladen:</span>{downloads}</div>' + listing)
+        self._page("Umsätze", card("Filter", form) + card("Umsätze", result), error=error)
+
+    # --- Export-Seite ------------------------------------------------------
+
+    def export_page(self) -> None:
+        cfg = self.app.cfg
+        error = ""
+        try:
+            filters = self._filters()
+        except ValueError as exc:
+            filters, error = dict.fromkeys(FILTERS, ""), str(exc)
+        with self._storage() as s:
+            accounts = self._filter_accounts(s, filters["account"])
+            count = len(self._rows(s, filters))
+
+        base = self._base_url()
+        endpoint = "/export" if cfg.export_enabled else "/download"
+
+        def url(params: dict[str, str]) -> str:
+            return f"{base}{endpoint}?{urlencode({k: v for k, v in params.items() if v})}"
+
+        selection = {k: v for k, v in filters.items() if v}
+        rows = "".join(
+            f'<tr><th>{fmt.upper()}</th><td><input class="url" id="link-{fmt}" readonly '
+            f'value="{esc(url(selection | {"format": fmt}))}"></td><td class="actions">'
+            f'<a class="button" href="{esc(url(selection | {"format": fmt}))}">Öffnen</a>'
+            f'<button type="button" class="secondary" data-copy="link-{fmt}">Kopieren</button></td></tr>'
+            for fmt in FORMATS)
+        found = "1 Umsatz" if count == 1 else f"{count} Umsätze"
+        links = (f"<p>Die Links enthalten die aktuelle Auswahl ({found}{describe(filters)}) und liefern "
+                 f"bei jedem Aufruf den aktuellen Stand.</p>"
+                 f'<div class="table"><table class="links">{rows}</table></div>{self._export_access()}')
+
+        self._page("Export", card("Auswahl", self._filter_form("/export/links", filters, accounts,
+                                                               "Links erzeugen"))
+                   + card("Export-Links", links) + self._examples_card(url, accounts)
+                   + self._parameters_card() + COPY_SCRIPT, error=error)
+
+    def _export_access(self) -> str:
+        cfg = self.app.cfg
+        if not cfg.export_enabled:
+            return ('<p class="warn">Der Export-Pfad <code>/export</code> ist abgeschaltet '
+                    "(<code>EB_EXPORT_ENABLED=false</code>). Die Links zeigen deshalb auf <code>/download</code> "
+                    "und funktionieren nur angemeldet in dieser Oberfläche.</p>")
+        if cfg.export_protected:
+            return ("<p class=\"hint\">Geschützt per Basic Auth: Beim Öffnen fragt der Browser nach Benutzer und "
+                    "Passwort aus <code>EB_EXPORT_USER</code> / <code>EB_EXPORT_PASSWORD</code>.</p>")
+        return ('<p class="hint"><span class="warn">Ohne Anmeldung abrufbar.</span> Mit <code>EB_EXPORT_USER</code> '
+                "und <code>EB_EXPORT_PASSWORD</code> lässt sich der Pfad per Basic Auth schützen.</p>")
+
+    def _examples_card(self, url, accounts) -> str:
+        today = date.today()
+        month_end = today.replace(day=1) - timedelta(days=1)
+        month_start = month_end.replace(day=1)
+        examples = [
+            ("Alle Umsätze", {"format": "csv"}),
+            (f"Letzte 5 Tage (ab {(today - timedelta(days=4)):%d.%m.%Y})", {"days": "5", "format": "csv"}),
+            ("Letzte 30 Tage als JSON", {"days": "30", "format": "json"}),
+            (f"Vormonat ({MONTHS[month_start.month - 1]} {month_start.year}) als XML",
+             {"date_from": month_start.isoformat(), "date_to": month_end.isoformat(), "format": "xml"}),
+            (f"Seit Jahresbeginn {today.year}", {"date_from": f"{today.year}-01-01", "format": "csv"}),
+            ("Suche nach „Miete“ in den letzten 90 Tagen", {"days": "90", "q": "Miete", "format": "csv"}),
+        ]
+        if accounts:
+            a = accounts[0][0]
+            examples.insert(3, (f"Nur Konto {a['iban'] or a['name'] or a['uid']}, letzte 5 Tage",
+                                {"account": a["iban"] or a["uid"], "days": "5", "format": "csv"}))
+        rows = "".join(
+            f'<tr><td>{esc(text)}</td><td><a href="{esc(url(params))}"><code>{esc(url(params))}</code></a></td></tr>'
+            for text, params in examples)
+        auth = "-u BENUTZER:PASSWORT " if self.app.cfg.export_protected else ""
+        commands = "\n".join((
+            "# Letzte 5 Tage als CSV speichern",
+            f"curl {auth}-o umsaetze.csv '{url({'days': '5', 'format': 'csv'})}'",
+            "",
+            "# Vormonat als JSON",
+            f"curl {auth}-o vormonat.json '{url({'date_from': month_start.isoformat(), 'date_to': month_end.isoformat(), 'format': 'json'})}'",
+        ))
+        return card("Beispiele", (
+            f'<div class="table"><table><tr><th>Beschreibung</th><th>Link</th></tr>{rows}</table></div>'
+            f"<p>Für Skripte, z. B. als täglicher Cron-Job:</p><pre>{esc(commands)}</pre>"))
+
+    @staticmethod
+    def _parameters_card() -> str:
+        params = (
+            ("format", "<code>csv</code> (Standard), <code>json</code> oder <code>xml</code>"),
+            ("days", "Nur die letzten N Tage, z. B. <code>days=5</code> = heute und die 4 Tage davor"),
+            ("date_from", "Ab diesem Datum (<code>JJJJ-MM-TT</code>); nicht zusammen mit <code>days</code>"),
+            ("date_to", "Bis zu diesem Datum (<code>JJJJ-MM-TT</code>), einschließlich"),
+            ("account", "Nur dieses Konto: IBAN (bleibt auch nach dem Neuverbinden der Bank gleich) "
+                        "oder Konto-ID"),
+            ("q", "Suchbegriff in Gegenpartei oder Verwendungszweck"),
+        )
+        rows = "".join(f"<tr><th><code>{name}</code></th><td>{text}</td></tr>" for name, text in params)
+        return card("Parameter", (
+            f'<div class="table"><table>{rows}</table></div>'
+            '<p class="hint">Alle Parameter sind optional und lassen sich kombinieren. Maßgeblich ist das '
+            "Buchungsdatum, ersatzweise Transaktions- oder Valutadatum.</p>"))
 
     # --- Rechtstexte -------------------------------------------------------
 
@@ -656,14 +1036,17 @@ class Handler(BaseHTTPRequestHandler):
     # --- Antworten ---------------------------------------------------------
 
     def _page(self, title: str, content: str, *, error: str = "", refresh: bool = False,
-              status: HTTPStatus = HTTPStatus.OK) -> None:
+              status: HTTPStatus = HTTPStatus.OK, nav: bool = True) -> None:
         notice = MESSAGES.get(self.params.get("msg", ""), "")
-        body = layout(title, content, notice=notice, error=error, refresh=refresh)
+        body = layout(title, content, notice=notice, error=error, refresh=refresh, nav=nav,
+                      logout=nav and self.app.cfg.login_required)
         self._send(status, "text/html; charset=utf-8", body.encode())
 
-    def _redirect(self, location: str) -> None:
+    def _redirect(self, location: str, headers: dict[str, str] | None = None) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", location)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -701,6 +1084,14 @@ def start_in_background(cfg: Config, sync: SyncService | None = None) -> Threadi
     threading.Thread(target=server.serve_forever, name="web", daemon=True).start()
     host, port = server.server_address[:2]
     log.info("Weboberfläche erreichbar unter http://%s:%d/", host, port)
-    if not cfg.web_token:
-        log.warning("EB_WEB_TOKEN ist nicht gesetzt; die Weboberfläche ist ohne Zugriffsschutz.")
+    if bool(cfg.web_user) != bool(cfg.web_password):
+        log.warning("Für den Login müssen EB_WEB_USER und EB_WEB_PASSWORD beide gesetzt sein.")
+    if not cfg.login_required:
+        log.warning("Kein Login konfiguriert; die Weboberfläche ist ohne Zugriffsschutz erreichbar.")
+    if cfg.export_enabled:
+        if bool(cfg.export_user) != bool(cfg.export_password):
+            log.warning("Für den Schutz des Exports müssen EB_EXPORT_USER und EB_EXPORT_PASSWORD "
+                        "beide gesetzt sein.")
+        if not cfg.export_protected:
+            log.warning("Der Export unter /export ist ohne Anmeldung abrufbar.")
     return server

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import signal
 import threading
 from datetime import date, datetime, timedelta, timezone
 
-from . import settings
+from . import mail, settings
 from .client import ApiError, EnableBankingClient
 from .config import Config, ConfigError
 from .storage import Storage, now_iso
@@ -18,8 +19,51 @@ log = logging.getLogger(__name__)
 NO_SESSION_RETRY = 60
 
 
+# Fehlercodes der API (Feld "error"), nach denen die Bank eine erneute Anmeldung verlangt.
+REAUTH_ERRORS = {
+    "EXPIRED_SESSION", "REVOKED_SESSION", "CLOSED_SESSION", "SESSION_DOES_NOT_EXIST",
+    "WRONG_SESSION_STATUS", "ASPSP_PSU_ACTION_REQUIRED",
+}
+
+# Schlüssel in der Tabelle settings, solange der automatische Abruf gesperrt ist.
+BLOCK_KEY = "fetch_blocked"
+
+
 class NoSessionError(RuntimeError):
     pass
+
+
+class ReauthRequired(NoSessionError):
+    """Die Bank verlangt eine erneute Anmeldung; weitere Abrufe sind zwecklos."""
+
+
+def needs_reauth(exc: ApiError) -> bool:
+    return isinstance(exc.payload, dict) and exc.payload.get("error") in REAUTH_ERRORS
+
+
+def get_block(storage: Storage) -> dict | None:
+    raw = storage.settings().get(BLOCK_KEY)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return {"reason": raw}
+
+
+def set_block(storage: Storage, reason: str, mail_result: str) -> dict:
+    block = {"reason": reason, "since": now_iso(), "mail": mail_result}
+    storage.save_settings({BLOCK_KEY: json.dumps(block, ensure_ascii=False)})
+    return block
+
+
+def clear_block(storage: Storage) -> bool:
+    """Gibt den automatischen Abruf wieder frei. True, wenn er gesperrt war."""
+    if get_block(storage) is None:
+        return False
+    storage.save_settings({BLOCK_KEY: None})
+    log.info("Automatischer Abruf wieder freigegeben.")
+    return True
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -43,7 +87,7 @@ def check_session_validity(storage: Storage) -> str:
     if valid_until:
         remaining = valid_until - datetime.now(timezone.utc)
         if remaining.total_seconds() <= 0:
-            raise NoSessionError(
+            raise ReauthRequired(
                 f"Die Zustimmung ist am {valid_until:%d.%m.%Y} abgelaufen. "
                 "Bitte die Bank in der Weboberfläche neu verbinden."
             )
@@ -113,13 +157,13 @@ def sync_all(
         try:
             sync_account(client, storage, cfg, acc["uid"], date_from, date_to)
         except ApiError as exc:
+            if needs_reauth(exc):
+                # Gilt für die ganze Session; die übrigen Konten nicht mehr anfragen.
+                raise ReauthRequired(
+                    f"Die Bank verlangt eine erneute Anmeldung ({exc.payload['error']}: {exc})."
+                ) from exc
             ok = False
             log.error("Abruf für Konto %s (%s) fehlgeschlagen: %s", acc["uid"], acc["iban"], exc)
-            if exc.status in (401, 403):
-                log.error(
-                    "Die Session ist möglicherweise ungültig oder widerrufen. "
-                    "Ggf. die Bank in der Weboberfläche neu verbinden."
-                )
         except Exception:
             ok = False
             log.exception("Unerwarteter Fehler beim Abruf für Konto %s", acc["uid"])
@@ -153,16 +197,25 @@ class SyncService:
         self._stop.set()
         self._wake.set()
 
-    def run_once(self) -> float:
-        """Führt einen Abruf aus und gibt die Wartezeit bis zum nächsten zurück."""
+    def run_once(self) -> float | None:
+        """Führt einen Abruf aus und gibt die Wartezeit bis zum nächsten zurück.
+
+        None bedeutet: Der Abruf ist gesperrt, bis er in der Weboberfläche freigegeben wird.
+        """
         with self._lock:
             self.running, self.requested = True, False
             try:
                 with Storage(self.cfg.db_path) as storage:
+                    if get_block(storage):
+                        self.last_error = None
+                        return None
                     client = settings.make_client(self.cfg, settings.load(self.cfg, storage))
                     ok = sync_all(client, storage, self.cfg)
                 self.last_error = None if ok else "Abruf für mindestens ein Konto fehlgeschlagen (siehe Konten)."
                 return self.cfg.fetch_interval
+            except ReauthRequired as exc:
+                self._block(str(exc))
+                return None
             except (ConfigError, NoSessionError) as exc:
                 # Ohne Einrichtung oder Session wird die API nicht angefragt; daher kurz warten.
                 if str(exc) != self.last_error:
@@ -176,6 +229,28 @@ class SyncService:
             finally:
                 self.running = False
                 self.last_finished = datetime.now(timezone.utc)
+
+    def _block(self, reason: str) -> None:
+        """Sperrt den automatischen Abruf und benachrichtigt den Notfallkontakt."""
+        log.error("%s Der automatische Abruf ist gestoppt, bis die Bank neu verbunden oder der "
+                  "Abruf in der Weboberfläche freigegeben wird.", reason)
+        self.last_error = None
+        with Storage(self.cfg.db_path) as storage:
+            session = storage.active_session()
+            redirect_url = settings.load(self.cfg, storage).redirect_url
+        if self.cfg.mail_configured:
+            subject, body = mail.reauth_message(session and session["aspsp_name"], reason,
+                                                mail.public_url(redirect_url))
+            try:
+                result = f"Benachrichtigung an {mail.send(self.cfg, subject, body)} gesendet."
+                log.info("%s", result)
+            except mail.MAIL_ERRORS as exc:
+                result = f"Benachrichtigung konnte nicht gesendet werden: {exc}"
+                log.error("%s", result)
+        else:
+            result = "Keine Benachrichtigung gesendet, der Mailversand ist nicht eingerichtet."
+        with Storage(self.cfg.db_path) as storage:
+            set_block(storage, reason, result)
 
     def run_forever(self) -> None:
         """Ruft in festem Intervall ab, bis SIGTERM/SIGINT empfangen wird."""
@@ -193,6 +268,11 @@ class SyncService:
             self._wake.clear()
             if self._stop.is_set():
                 break
+            if delay is None:
+                # Gesperrt: erst nach Freigabe in der Weboberfläche (trigger) weitermachen.
+                self.next_run = None
+                self._wake.wait()
+                continue
             self.next_run = datetime.now(timezone.utc) + timedelta(seconds=delay)
             if delay == self.cfg.fetch_interval:
                 log.info("Nächster Abruf: %s", self.next_run.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
