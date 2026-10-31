@@ -448,6 +448,7 @@ class Handler(BaseHTTPRequestHandler):
             total = s.count_transactions()
             recent = s.recent_transactions(10)
             block = get_block(s)
+            last_fetch = s.last_fetch()
 
         parts = []
         if not st.complete:
@@ -456,7 +457,7 @@ class Handler(BaseHTTPRequestHandler):
                 "privaten Schlüssel deiner Enable-Banking-Anwendung ein.</p>"
                 '<a class="button" href="/settings">Zu den Einstellungen</a>')))
         parts.append(self._session_card(session, st))
-        parts.append(self._block_card(block) if block else self._sync_card(session))
+        parts.append(self._block_card(block) if block else self._sync_card(session, last_fetch))
         if accounts:
             parts.append(self._accounts_card(accounts))
         parts.append(self._recent_card(recent, total))
@@ -492,15 +493,15 @@ class Handler(BaseHTTPRequestHandler):
             "freigeben</button></form></div>"
             '<p class="hint">Nach dem Neuverbinden läuft der Abruf automatisch wieder.</p>'))
 
-    def _sync_card(self, session) -> str:
+    def _sync_card(self, session, last_fetch: str | None) -> str:
         sync = self.app.sync
         if sync is None:
             return card("Abruf", "<p class=\"muted\">Der automatische Abruf läuft in diesem Prozess nicht.</p>")
         lines = []
         if sync.busy:
             lines.append('<p><strong>Abruf läuft …</strong> Die Seite aktualisiert sich automatisch.</p>')
-        elif sync.last_finished:
-            lines.append(f"<p>Letzter Abruf: {moment(sync.last_finished)}</p>")
+        elif last_fetch:
+            lines.append(f"<p>Letzter Abruf: {moment(last_fetch)}</p>")
         if sync.last_error and not sync.busy:
             lines.append(f'<p class="err">{esc(sync.last_error)}</p>')
         if sync.next_run and not sync.busy:

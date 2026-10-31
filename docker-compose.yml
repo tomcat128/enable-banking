@@ -1,7 +1,7 @@
 services:
   enable-banking:
     build: .
-    image: enable-banking-sync:latest
+    image: fehrenbacher/banking:latest
     container_name: enable-banking
     restart: unless-stopped
     # Optional: Alles Nötige wird in der Weboberfläche eingetragen (Compose >= 2.24).

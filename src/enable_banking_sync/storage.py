@@ -443,6 +443,10 @@ class Storage:
                 (account_uid, started_at, date_from, date_to, received, inserted, error),
             )
 
+    def last_fetch(self) -> str | None:
+        """Beginn des letzten Abrufs bei der Bank (über alle Konten)."""
+        return self.conn.execute("SELECT MAX(started_at) FROM fetch_runs").fetchone()[0]
+
     def last_run(self, account_uid: str) -> sqlite3.Row | None:
         return self.conn.execute(
             "SELECT * FROM fetch_runs WHERE account_uid = ? ORDER BY id DESC LIMIT 1",

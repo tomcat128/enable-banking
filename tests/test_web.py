@@ -62,7 +62,7 @@ class FakeClient:
 
 class FakeSync:
     busy = False
-    last_finished = last_error = next_run = None
+    last_error = next_run = None
 
     def __init__(self):
         self.triggered = 0
@@ -140,6 +140,14 @@ def test_index_shows_accounts_and_recent_transactions(serve):
     assert "DE11" in body and "Giro" in body
     assert "-1,00 EUR" in body and "Laden" in body
     assert 'action="/fetch"' in body
+
+
+def test_index_shows_last_fetch_from_database(serve):
+    site = serve()
+    assert "Letzter Abruf:" not in site.get("/")[2]
+    with Storage(site.cfg.db_path) as s:
+        s.log_run("u1", "2026-10-30T08:15:00+00:00", "2026-10-01", None, 2, 1)
+    assert "Letzter Abruf: 30.10.2026" in site.get("/")[2]
 
 
 def test_index_asks_for_setup_when_not_configured(serve):
@@ -357,7 +365,8 @@ def test_login_rejects_tampered_cookie(serve):
     _, headers, _ = _login(site)
     cookie = _cookie(headers)["Cookie"]
     expires, _, signature = cookie.partition("=")[2].partition(".")
-    for forged in (f"{int(expires) + 999}.{signature}", f"{expires}.{signature[:-1]}0", "kaputt", "1.abc"):
+    changed = signature[:-1] + ("1" if signature.endswith("0") else "0")
+    for forged in (f"{int(expires) + 999}.{signature}", f"{expires}.{changed}", "kaputt", "1.abc"):
         assert site.get("/", headers={"Cookie": f"eb_session={forged}"})[0] == 303
 
 

@@ -52,6 +52,25 @@ def test_parse_redirect():
         settings.parse_redirect("https://x/cb?state=s")
 
 
+def _log_run(cfg, hours_ago):
+    from datetime import datetime, timedelta, timezone
+    started = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    with Storage(cfg.db_path) as s:
+        s.log_run("u1", started.isoformat(timespec="seconds"), None, None, 0, 0)
+
+
+def test_first_fetch_after_start_respects_last_fetch_in_database(tmp_path):
+    cfg = _cfg(tmp_path, fetch_interval=6 * 3600)
+    service = SyncService(cfg)
+    assert service.initial_delay() == 0  # noch nie abgerufen: sofort
+
+    _log_run(cfg, hours_ago=7)
+    assert service.initial_delay() == 0  # Intervall abgelaufen: sofort
+
+    _log_run(cfg, hours_ago=1)  # z. B. vor dem Neuerstellen des Containers
+    assert 5 * 3600 - 5 <= SyncService(cfg).initial_delay() <= 5 * 3600
+
+
 def test_sync_service_waits_briefly_without_setup(tmp_path):
     service = SyncService(_cfg(tmp_path, application_id=None))
     service.trigger()

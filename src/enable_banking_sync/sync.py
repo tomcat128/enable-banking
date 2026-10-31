@@ -177,7 +177,6 @@ class SyncService:
         self.cfg = cfg
         self.running = False
         self.requested = False
-        self.last_finished: datetime | None = None
         self.last_error: str | None = None
         self.next_run: datetime | None = None
         self._wake = threading.Event()
@@ -228,7 +227,6 @@ class SyncService:
                 return self.cfg.fetch_interval
             finally:
                 self.running = False
-                self.last_finished = datetime.now(timezone.utc)
 
     def _block(self, reason: str) -> None:
         """Sperrt den automatischen Abruf und benachrichtigt den Notfallkontakt."""
@@ -252,6 +250,20 @@ class SyncService:
         with Storage(self.cfg.db_path) as storage:
             set_block(storage, reason, result)
 
+    def initial_delay(self) -> float:
+        """Wartezeit bis zum ersten Abruf nach dem Start.
+
+        Der letzte Abruf steht in der Datenbank im Datenverzeichnis und übersteht damit auch das
+        Neuerstellen von Container und Image. Liegt er weniger als ein Intervall zurück, wird
+        der Rest abgewartet, statt bei jedem Start sofort abzurufen.
+        """
+        with Storage(self.cfg.db_path) as storage:
+            last = _parse_ts(storage.last_fetch())
+        if last is None:
+            return 0
+        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+        return max(0.0, self.cfg.fetch_interval - elapsed)
+
     def run_forever(self) -> None:
         """Ruft in festem Intervall ab, bis SIGTERM/SIGINT empfangen wird."""
 
@@ -263,17 +275,19 @@ class SyncService:
         signal.signal(signal.SIGINT, _handle)
 
         log.info("Starte periodischen Abruf alle %d Sekunden", self.cfg.fetch_interval)
+        delay: float | None = self.initial_delay()
         while not self._stop.is_set():
-            delay = self.run_once()
-            self._wake.clear()
-            if self._stop.is_set():
-                break
             if delay is None:
                 # Gesperrt: erst nach Freigabe in der Weboberfläche (trigger) weitermachen.
                 self.next_run = None
                 self._wake.wait()
-                continue
-            self.next_run = datetime.now(timezone.utc) + timedelta(seconds=delay)
-            if delay == self.cfg.fetch_interval:
-                log.info("Nächster Abruf: %s", self.next_run.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
-            self._wake.wait(delay)
+            elif delay > 0:
+                self.next_run = datetime.now(timezone.utc) + timedelta(seconds=delay)
+                if delay != NO_SESSION_RETRY:
+                    log.info("Nächster Abruf: %s", self.next_run.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+                self._wake.wait(delay)
+            # Ein Anstoß während des laufenden Abrufs bleibt gesetzt und führt sofort zum nächsten.
+            self._wake.clear()
+            if self._stop.is_set():
+                break
+            delay = self.run_once()

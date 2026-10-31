@@ -60,10 +60,15 @@ Die Formate:
 
 ## Automatischer Abruf
 
-Der Abruf läuft im selben Container, ein Cron-Job ist nicht nötig: einmal direkt beim Start, danach
-jeweils `EB_FETCH_INTERVAL_SECONDS` (Standard 6 Stunden) nach dem Ende des vorherigen Abrufs. Banken
-erlauben ohne erneute Anmeldung (PSD2) häufig nur 4 Abrufe pro Tag und Konto; auch jeder Neustart des
-Containers löst einen Abruf aus.
+Der Abruf läuft im selben Container, ein Cron-Job ist nicht nötig. Er findet jeweils
+`EB_FETCH_INTERVAL_SECONDS` (Standard 6 Stunden) nach dem letzten Abruf statt; **Jetzt abrufen** in der
+Übersicht startet ihn sofort.
+
+Der Zeitpunkt des letzten Abrufs steht in der Datenbank im Datenverzeichnis. Ein Neustart oder das
+Neuerstellen von Container und Image (z. B. bei einem Update) löst deshalb keinen zusätzlichen Abruf aus:
+Liegt der letzte Abruf weniger als ein Intervall zurück, wartet der Container den Rest ab. Das ist wichtig,
+weil Banken ohne erneute Anmeldung (PSD2) häufig nur 4 Abrufe pro Tag und Konto erlauben. Voraussetzung
+ist, dass das Datenverzeichnis wie in der `docker-compose.yml` eingebunden ist.
 
 Verlangt die Bank eine erneute Anmeldung (Freigabe abgelaufen oder widerrufen, API-Fehler wie
 `EXPIRED_SESSION`, `REVOKED_SESSION` oder `ASPSP_PSU_ACTION_REQUIRED`), stoppt der automatische Abruf und
