@@ -7,13 +7,14 @@ import signal
 import threading
 from datetime import date, datetime, timedelta, timezone
 
+from . import settings
 from .client import ApiError, EnableBankingClient
-from .config import Config
+from .config import Config, ConfigError
 from .storage import Storage, now_iso
 
 log = logging.getLogger(__name__)
 
-# Wartezeit im run-Modus, solange noch keine (gültige) Session existiert.
+# Wartezeit im run-Modus, solange Einrichtung oder (gültige) Session fehlen.
 NO_SESSION_RETRY = 60
 
 
@@ -36,7 +37,7 @@ def check_session_validity(storage: Storage) -> str:
     session = storage.active_session()
     if not session:
         raise NoSessionError(
-            "Keine aktive Session vorhanden. Bitte zuerst 'enable-banking authorize' ausführen."
+            "Keine aktive Session vorhanden. Bitte in der Weboberfläche die Bank verbinden."
         )
     valid_until = _parse_ts(session["valid_until"])
     if valid_until:
@@ -44,7 +45,7 @@ def check_session_validity(storage: Storage) -> str:
         if remaining.total_seconds() <= 0:
             raise NoSessionError(
                 f"Die Zustimmung ist am {valid_until:%d.%m.%Y} abgelaufen. "
-                "Bitte 'enable-banking authorize' erneut ausführen."
+                "Bitte die Bank in der Weboberfläche neu verbinden."
             )
         if remaining < timedelta(days=7):
             log.warning(
@@ -117,7 +118,7 @@ def sync_all(
             if exc.status in (401, 403):
                 log.error(
                     "Die Session ist möglicherweise ungültig oder widerrufen. "
-                    "Ggf. 'enable-banking authorize' erneut ausführen."
+                    "Ggf. die Bank in der Weboberfläche neu verbinden."
                 )
         except Exception:
             ok = False
@@ -125,34 +126,74 @@ def sync_all(
     return ok
 
 
-def run_forever(client: EnableBankingClient, storage: Storage, cfg: Config) -> None:
-    """Ruft in festem Intervall ab, bis SIGTERM/SIGINT empfangen wird."""
-    stop = threading.Event()
+class SyncService:
+    """Periodischer Abruf im Hintergrund, der sich aus der Weboberfläche anstoßen lässt."""
 
-    def _handle(signum, _frame):
-        log.info("Signal %s empfangen, beende ...", signal.Signals(signum).name)
-        stop.set()
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.running = False
+        self.requested = False
+        self.last_finished: datetime | None = None
+        self.last_error: str | None = None
+        self.next_run: datetime | None = None
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
 
-    signal.signal(signal.SIGTERM, _handle)
-    signal.signal(signal.SIGINT, _handle)
+    @property
+    def busy(self) -> bool:
+        return self.running or self.requested
 
-    log.info("Starte periodischen Abruf alle %d Sekunden", cfg.fetch_interval)
-    waiting_for_session = False
-    while not stop.is_set():
-        try:
-            sync_all(client, storage, cfg)
-            waiting_for_session = False
-        except NoSessionError as exc:
-            # Ohne Session wird die API nicht angefragt; daher kurz warten, damit der
-            # Abruf direkt nach "authorize" im laufenden Container startet.
-            if not waiting_for_session:
-                log.error("%s", exc)
-                log.info("Prüfe alle %d Sekunden, ob eine Session vorhanden ist", NO_SESSION_RETRY)
-            waiting_for_session = True
-            stop.wait(NO_SESSION_RETRY)
-            continue
-        except Exception:
-            log.exception("Abruf fehlgeschlagen")
-        next_run = datetime.now() + timedelta(seconds=cfg.fetch_interval)
-        log.info("Nächster Abruf: %s", next_run.strftime("%Y-%m-%d %H:%M:%S"))
-        stop.wait(cfg.fetch_interval)
+    def trigger(self) -> None:
+        """Startet den nächsten Abruf sofort."""
+        self.requested = True
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def run_once(self) -> float:
+        """Führt einen Abruf aus und gibt die Wartezeit bis zum nächsten zurück."""
+        with self._lock:
+            self.running, self.requested = True, False
+            try:
+                with Storage(self.cfg.db_path) as storage:
+                    client = settings.make_client(self.cfg, settings.load(self.cfg, storage))
+                    ok = sync_all(client, storage, self.cfg)
+                self.last_error = None if ok else "Abruf für mindestens ein Konto fehlgeschlagen (siehe Konten)."
+                return self.cfg.fetch_interval
+            except (ConfigError, NoSessionError) as exc:
+                # Ohne Einrichtung oder Session wird die API nicht angefragt; daher kurz warten.
+                if str(exc) != self.last_error:
+                    log.info("%s", exc)
+                self.last_error = str(exc)
+                return NO_SESSION_RETRY
+            except Exception as exc:
+                log.exception("Abruf fehlgeschlagen")
+                self.last_error = str(exc)
+                return self.cfg.fetch_interval
+            finally:
+                self.running = False
+                self.last_finished = datetime.now(timezone.utc)
+
+    def run_forever(self) -> None:
+        """Ruft in festem Intervall ab, bis SIGTERM/SIGINT empfangen wird."""
+
+        def _handle(signum, _frame):
+            log.info("Signal %s empfangen, beende ...", signal.Signals(signum).name)
+            self.stop()
+
+        signal.signal(signal.SIGTERM, _handle)
+        signal.signal(signal.SIGINT, _handle)
+
+        log.info("Starte periodischen Abruf alle %d Sekunden", self.cfg.fetch_interval)
+        while not self._stop.is_set():
+            delay = self.run_once()
+            self._wake.clear()
+            if self._stop.is_set():
+                break
+            self.next_run = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            if delay == self.cfg.fetch_interval:
+                log.info("Nächster Abruf: %s", self.next_run.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+            self._wake.wait(delay)

@@ -1,4 +1,8 @@
-"""Konfiguration über Umgebungsvariablen."""
+"""Konfiguration über Umgebungsvariablen.
+
+Zugangsdaten (Application ID, Schlüssel, Redirect-URL) werden normalerweise in der
+Weboberfläche eingetragen; die Variablen dienen dann nur als Vorbelegung (siehe settings.py).
+"""
 
 from __future__ import annotations
 
@@ -32,7 +36,7 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class Config:
-    application_id: str
+    application_id: str | None
     private_key_path: Path
     api_base: str
     redirect_url: str | None
@@ -55,7 +59,7 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
-            application_id=_env("EB_APPLICATION_ID", required=True),
+            application_id=_env("EB_APPLICATION_ID"),
             private_key_path=Path(_env("EB_PRIVATE_KEY_PATH", "/secrets/private.pem")),
             api_base=_env("EB_API_BASE", "https://api.enablebanking.com").rstrip("/"),
             redirect_url=_env("EB_REDIRECT_URL"),
@@ -71,11 +75,3 @@ class Config:
             web_port=_env_int("EB_WEB_PORT", 8080),
             web_token=_env("EB_WEB_TOKEN"),
         )
-
-    def read_private_key(self) -> str:
-        try:
-            return self.private_key_path.read_text()
-        except OSError as exc:
-            raise ConfigError(
-                f"Private Key konnte nicht gelesen werden ({self.private_key_path}): {exc}"
-            ) from exc

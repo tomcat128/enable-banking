@@ -6,39 +6,38 @@ import argparse
 import json
 import logging
 import os
+import sqlite3
 import sys
 import uuid
 from datetime import date
-from urllib.parse import parse_qs, urlparse
 
-from . import __version__, export, web
+from . import __version__, export, settings, web
 from .client import ApiError, EnableBankingClient
 from .config import Config, ConfigError
 from .storage import Storage
-from .sync import NoSessionError, run_forever, sync_all
+from .sync import NoSessionError, SyncService, sync_all
 
 log = logging.getLogger("enable_banking_sync")
 
 
+def _settings(cfg: Config) -> settings.Settings:
+    with Storage(cfg.db_path) as storage:
+        return settings.load(cfg, storage)
+
+
 def _client(cfg: Config) -> EnableBankingClient:
-    return EnableBankingClient(cfg.application_id, cfg.read_private_key(), cfg.api_base)
+    return settings.make_client(cfg, _settings(cfg))
 
 
 def _extract_code(value: str, expected_state: str | None) -> str:
     """Akzeptiert entweder den reinen Code oder die komplette Redirect-URL."""
-    value = value.strip()
-    if "://" not in value and "?" not in value:
-        return value
-    query = parse_qs(urlparse(value).query)
-    if "error" in query:
-        desc = query.get("error_description", [""])[0]
-        raise SystemExit(f"Autorisierung fehlgeschlagen: {query['error'][0]} {desc}".strip())
-    if "code" not in query:
-        raise SystemExit("In der URL wurde kein Parameter 'code' gefunden.")
-    state = query.get("state", [None])[0]
+    try:
+        code, state = settings.parse_redirect(value)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if expected_state and state and state != expected_state:
         raise SystemExit("Der Parameter 'state' passt nicht zur gestarteten Autorisierung.")
-    return query["code"][0]
+    return code
 
 
 # --- Befehle ---------------------------------------------------------------
@@ -51,7 +50,7 @@ def cmd_info(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_banks(cfg: Config, args: argparse.Namespace) -> int:
-    aspsps = _client(cfg).list_aspsps(args.country or cfg.aspsp_country, cfg.psu_type)
+    aspsps = _client(cfg).list_aspsps(args.country or _settings(cfg).aspsp_country, cfg.psu_type)
     for a in aspsps:
         if args.search and args.search.lower() not in a["name"].lower():
             continue
@@ -60,14 +59,15 @@ def cmd_banks(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_authorize(cfg: Config, args: argparse.Namespace) -> int:
-    client = _client(cfg)
+    st = _settings(cfg)
+    client = settings.make_client(cfg, st)
     aspsp_name = args.bank or cfg.aspsp_name
-    country = (args.country or cfg.aspsp_country).upper()
-    redirect_url = args.redirect_url or cfg.redirect_url
+    country = (args.country or st.aspsp_country).upper()
+    redirect_url = args.redirect_url or st.redirect_url
     if not aspsp_name:
         raise ConfigError("Bank fehlt: EB_ASPSP_NAME setzen oder --bank angeben (siehe 'banks').")
     if not redirect_url:
-        raise ConfigError("Redirect-URL fehlt: EB_REDIRECT_URL setzen oder --redirect-url angeben.")
+        raise ConfigError("Redirect-URL fehlt: in den Einstellungen eintragen oder --redirect-url angeben.")
 
     if args.code:
         code = _extract_code(args.code, None)
@@ -111,11 +111,17 @@ def cmd_fetch(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
-    client = _client(cfg)
-    server = web.start_in_background(cfg)
     try:
-        with Storage(cfg.db_path) as storage:
-            run_forever(client, storage, cfg)
+        Storage(cfg.db_path).close()
+    except sqlite3.OperationalError as exc:
+        raise ConfigError(
+            f"Datenbank {cfg.db_path} kann nicht angelegt werden ({exc}). Ist das Datenverzeichnis "
+            f"für UID {os.getuid()} beschreibbar? Ggf. 'sudo chown {os.getuid()} <datenverzeichnis>'."
+        ) from exc
+    service = SyncService(cfg)
+    server = web.start_in_background(cfg, service)
+    try:
+        service.run_forever()
     finally:
         server.shutdown()
     return 0
@@ -125,7 +131,7 @@ def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
     with Storage(cfg.db_path) as storage:
         session = storage.active_session()
         if not session:
-            print("Keine aktive Session. Bitte 'authorize' ausführen.")
+            print("Keine aktive Session. Bitte in der Weboberfläche die Bank verbinden.")
             return 1
         print(f"Session:     {session['session_id']}")
         print(f"Bank:        {session['aspsp_name']} ({session['aspsp_country']})")
@@ -193,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--date-from", help="Startdatum YYYY-MM-DD (Standard: inkrementell)")
     f.add_argument("--date-to", help="Enddatum YYYY-MM-DD")
 
-    sub.add_parser("run", help="Periodischer Abruf und Exportseite (Standard im Container)")
+    sub.add_parser("run", help="Weboberfläche und periodischer Abruf (Standard im Container)")
     sub.add_parser("status", help="Session, Konten und letzten Abruf anzeigen")
 
     e = sub.add_parser("export", help="Gespeicherte Umsätze exportieren")

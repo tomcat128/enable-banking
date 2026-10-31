@@ -4,14 +4,15 @@ services:
     image: enable-banking-sync:latest
     container_name: enable-banking
     restart: unless-stopped
-    env_file: .env
+    # Optional: Alles Nötige wird in der Weboberfläche eingetragen (Compose >= 2.24).
+    env_file:
+      - path: .env
+        required: false
     ports:
-      # Exportseite; Zugriff nur mit EB_WEB_TOKEN (siehe .env).
+      # Weboberfläche: http://<server>:8080/
       - "${EB_WEB_BIND:-0.0.0.0}:${EB_WEB_HOST_PORT:-8080}:8080"
     volumes:
-      # Datenverzeichnis (SQLite-Datenbank wird beim ersten Start angelegt)
+      # Datenverzeichnis (Datenbank inkl. Einstellungen; wird beim ersten Start angelegt)
       - ${EB_DATA_PATH:-./data}:/data
-      # Privater Schlüssel der Enable-Banking-Anwendung
-      - ${EB_KEY_PATH:-./secrets/private.pem}:/secrets/private.pem:ro
-    # Standardbefehl ist "run" (periodischer Abruf + Exportseite).
-    # Einmalige Befehle im laufenden Container: docker compose exec enable-banking enable-banking <befehl>
+      # Optional: Schlüsseldatei statt Eingabe in der Weboberfläche
+      # - ./secrets/private.pem:/secrets/private.pem:ro

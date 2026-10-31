@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS balances (
     raw            TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS fetch_runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     account_uid  TEXT NOT NULL,
@@ -159,6 +164,24 @@ class Storage:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    # --- Einstellungen -----------------------------------------------------
+
+    def settings(self) -> dict[str, str]:
+        return {r["key"]: r["value"] for r in self.conn.execute("SELECT key, value FROM settings")}
+
+    def save_settings(self, values: dict[str, str | None]) -> None:
+        """Speichert Einstellungen; None oder leer entfernt den Eintrag."""
+        with self.conn:
+            for key, value in values.items():
+                if value:
+                    self.conn.execute(
+                        "INSERT INTO settings (key, value) VALUES (?, ?)"
+                        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (key, value),
+                    )
+                else:
+                    self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
 
     # --- Sessions & Konten -------------------------------------------------
 
@@ -345,7 +368,16 @@ class Storage:
         sql += f" ORDER BY {day}, tx_key"
         return self.conn.execute(sql, params).fetchall()
 
-    def count_transactions(self, account_uid: str) -> int:
+    def recent_transactions(self, limit: int = 50) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM transactions"
+            " ORDER BY COALESCE(booking_date, transaction_date, value_date) DESC, tx_key LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def count_transactions(self, account_uid: str | None = None) -> int:
+        if account_uid is None:
+            return self.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
         return self.conn.execute(
             "SELECT COUNT(*) FROM transactions WHERE account_uid = ?", (account_uid,)
         ).fetchone()[0]
