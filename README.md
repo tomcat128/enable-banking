@@ -70,18 +70,26 @@ Container jede Minute erneut und startet den ersten Abruf direkt nach der Autori
 `redirect/` enthält eine kleine PHP-Seite, die als Ziel der Redirect-URL dient. Sie zeigt die
 vollständige URL samt `?code=...` zum Kopieren an, dazu den fertigen `authorize --code`-Befehl. Sie
 speichert nichts, und das Image protokolliert Zugriffe ohne Query-String, damit der Code nicht im Log
-landet.
+landet. Daneben liegen eine Datenschutzerklärung und Nutzungsbedingungen (jeweils Deutsch und Englisch),
+die bei der Registrierung der Anwendung im Control Panel angegeben werden können.
+
+| Datei | Adresse |
+|---|---|
+| `html/callback/callback.php` | `/callback/` bzw. `/callback/callback.php` |
+| `html/callback/privacy.html` | `/callback/privacy.html` |
+| `html/callback/terms.html` | `/callback/terms.html` |
+
+In beiden HTML-Dateien vor dem Bauen die Platzhalter `{{NAME}}`, `{{ADRESSE}}` und `{{EMAIL}}` ersetzen.
 
 ```bash
 docker build -t enable-banking-redirect redirect/
 docker run -d --name enable-banking-redirect -p 8081:80 --restart unless-stopped enable-banking-redirect
 ```
 
-Die Seite ist unter `/` und `/callback.php` erreichbar. Die öffentliche Adresse (z. B.
-`https://bank.example.org/callback.php`) als Redirect-URL im Enable Banking Control Panel und als
-`EB_REDIRECT_URL` eintragen. Läuft ein Reverse Proxy mit HTTPS davor, muss er `X-Forwarded-Proto: https`
-setzen, damit die angezeigte URL mit `https://` beginnt. Alternativ lässt sich `redirect/callback.php`
-auf jeden vorhandenen PHP-Webserver kopieren.
+Die öffentliche Adresse (z. B. `https://bank.example.org/callback/`) als Redirect-URL im Enable Banking
+Control Panel und als `EB_REDIRECT_URL` eintragen. Läuft ein Reverse Proxy mit HTTPS davor, muss er
+`X-Forwarded-Proto: https` setzen, damit die angezeigte URL mit `https://` beginnt. Alternativ lässt sich
+der Inhalt von `redirect/html/` auf jeden vorhandenen PHP-Webserver kopieren.
 
 Die Zustimmung ist je nach Bank bis zu 90/180 Tage gültig (`EB_ACCESS_DAYS`). Sieben Tage vor Ablauf
 erscheinen Warnungen im Log; danach `authorize` erneut ausführen.

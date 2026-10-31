@@ -1,0 +1,23 @@
+services:
+  caddy:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/www/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    container_name: caddy
+
+  banking:
+    image: php:8.5-apache
+    restart: always
+    volumes:
+      - /var/www/sites/banking/html:/var/www/html
+      - /var/www/sites/banking/conf/apache.conf:/etc/apache2/sites-available/000-default.conf
+
+volumes:
+  caddy_data:
+  caddy_config:
