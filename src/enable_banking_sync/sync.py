@@ -236,6 +236,10 @@ class SyncService:
         """Plant den nächsten Abruf neu, nachdem der Zeitplan geändert wurde."""
         self.next_run = self._next_slot(datetime.now(timezone.utc))
 
+    def retry_mail(self) -> None:
+        """Eine fällige Benachrichtigung ohne Wartezeit erneut versuchen, z. B. an neue Adressen."""
+        self._mail_retry = None
+
     def _next_slot(self, now: datetime) -> datetime | None:
         with Storage(self.cfg.db_path) as storage:
             slot = schedule.next_run(schedule.load(storage), now)
@@ -296,13 +300,13 @@ class SyncService:
             if index is None:
                 return
             session = storage.active_session()
-            redirect_url = settings.load(self.cfg, storage).redirect_url
-        if self.cfg.mail_configured:
+            st = settings.load(self.cfg, storage)
+        if self.cfg.smtp_configured and st.alert_email:
             subject, body = mail.reauth_message(
-                session and session["aspsp_name"], block.get("reason", ""), mail.public_url(redirect_url),
+                session and session["aspsp_name"], block.get("reason", ""), mail.public_url(st.redirect_url),
                 index, _parse_ts(block.get("since")))
             try:
-                recipients = mail.send(self.cfg, subject, body)
+                recipients = mail.send(self.cfg, st.alert_email, subject, body)
             except mail.MAIL_ERRORS as exc:
                 block["mail"] = f"Benachrichtigung konnte nicht gesendet werden: {exc}"
                 self._mail_retry = now + MAIL_RETRY

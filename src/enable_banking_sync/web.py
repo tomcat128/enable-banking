@@ -41,6 +41,7 @@ MONTHS = ("Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August"
 MESSAGES = {
     "saved": "Einstellungen gespeichert.",
     "schedule": "Abrufzeiten gespeichert.",
+    "alert": "Notfallkontakt gespeichert.",
     "connected": "Bank verbunden. Der erste Abruf läuft.",
     "fetch": "Abruf gestartet.",
     "setup": "Bitte zuerst Application ID und privaten Schlüssel eintragen.",
@@ -336,6 +337,7 @@ class Handler(BaseHTTPRequestHandler):
         ("POST", "/fetch"): "fetch",
         ("POST", "/fetch/resume"): "resume_fetch",
         ("POST", "/settings/mail"): "test_mail",
+        ("POST", "/settings/alert"): "save_alert_email",
         ("GET", "/export"): "export",
         ("GET", "/privacy"): "privacy",
         ("GET", "/privacy.html"): "privacy",
@@ -498,7 +500,7 @@ class Handler(BaseHTTPRequestHandler):
             '<p class="hint">Nach dem Neuverbinden läuft der Abruf automatisch wieder.</p>'))
 
     def _reminder_note(self, block: dict) -> str:
-        if not self.app.cfg.mail_configured:
+        if not (self.app.cfg.smtp_configured and self._settings().alert_email):
             return ""
         following = next_reminder(block)
         if following is None:
@@ -560,7 +562,7 @@ class Handler(BaseHTTPRequestHandler):
     # --- Einstellungen -----------------------------------------------------
 
     def settings_page(self, *, error: str = "", values: dict | None = None, result: str = "",
-                      schedule_values: dict[str, str] | None = None) -> None:
+                      schedule_values: dict[str, str] | None = None, alert_value: str | None = None) -> None:
         st = self._settings()
         v = values or {
             "application_id": st.application_id, "redirect_url": st.redirect_url,
@@ -606,7 +608,7 @@ class Handler(BaseHTTPRequestHandler):
 <form method="post" action="/settings/test"><button>Verbindung testen</button></form>"""
         self._page("Einstellungen",
                    card("Zugangsdaten", form) + result + card("Control Panel", urls)
-                   + self._schedule_card(schedule_values) + self._mail_card(), error=error)
+                   + self._schedule_card(schedule_values) + self._mail_card(alert_value), error=error)
 
     def _schedule_card(self, values: dict[str, str] | None) -> str:
         with self._storage() as storage:
@@ -645,30 +647,62 @@ class Handler(BaseHTTPRequestHandler):
             self.app.sync.reschedule()
         self._redirect("/settings?msg=schedule")
 
-    def _mail_card(self) -> str:
+    def _mail_card(self, alert_value: str | None = None) -> str:
         cfg = self.app.cfg
-        intro = ("<p>Verlangt die Bank eine erneute Anmeldung, stoppt der automatische Abruf und der "
-                 "Notfallkontakt erhält sofort eine E-Mail. Ist die Bank dann noch nicht neu verbunden, "
-                 f"folgen Erinnerungen nach {mail.FOLLOW_UPS} Tagen, danach keine weiteren.</p>")
-        if not cfg.mail_configured:
-            return card("Benachrichtigung per E-Mail", intro + (
-                '<p class="warn">Der Mailversand ist nicht eingerichtet.</p><p class="hint">In der <code>.env</code> '
-                "mindestens <code>EB_SMTP_HOST</code>, <code>EB_SMTP_USER</code> und <code>EB_SMTP_PASSWORD</code> "
-                "(oder <code>EB_SMTP_FROM</code>) sowie <code>EB_ALERT_EMAIL</code> setzen und den Container neu "
-                "starten.</p>"))
-        rows = (("SMTP-Server", f"{cfg.smtp_host}:{cfg.smtp_port} ({cfg.smtp_security})"),
-                ("Benutzer", cfg.smtp_user or "– (ohne Anmeldung)"),
-                ("Absender", cfg.smtp_from or cfg.smtp_user),
-                ("Notfallkontakt", ", ".join(cfg.alert_email)))
-        table = "".join(f"<tr><th>{label}</th><td>{esc(value)}</td></tr>" for label, value in rows)
-        return card("Benachrichtigung per E-Mail", intro + (
-            f'<div class="table"><table>{table}</table></div>'
-            '<form method="post" action="/settings/mail"><button>Test-Mail senden</button></form>'))
+        st = self._settings()
+        parts = [("<p>Verlangt die Bank eine erneute Anmeldung, stoppt der automatische Abruf und der "
+                  "Notfallkontakt erhält sofort eine E-Mail. Ist die Bank dann noch nicht neu verbunden, "
+                  f"folgen Erinnerungen nach {mail.FOLLOW_UPS} Tagen, danach keine weiteren.</p>")]
+        if cfg.smtp_configured:
+            rows = (("SMTP-Server", f"{cfg.smtp_host}:{cfg.smtp_port} ({cfg.smtp_security})"),
+                    ("Benutzer", cfg.smtp_user or "– (ohne Anmeldung)"),
+                    ("Absender", cfg.smtp_from or cfg.smtp_user))
+            table = "".join(f"<tr><th>{label}</th><td>{esc(value)}</td></tr>" for label, value in rows)
+            parts.append(f'<div class="table"><table>{table}</table></div>')
+        else:
+            parts.append(
+                '<p class="warn">Der Mailversand ist nicht eingerichtet.</p><p class="hint">In der '
+                "<code>.env</code> mindestens <code>EB_SMTP_HOST</code>, <code>EB_SMTP_USER</code> und "
+                "<code>EB_SMTP_PASSWORD</code> (oder <code>EB_SMTP_FROM</code>) setzen und den Container neu "
+                "starten.</p>")
+        if not st.alert_email:
+            parts.append('<p class="warn">Es ist noch kein Notfallkontakt eingetragen.</p>')
+        else:
+            source = "eigene Adressen" if st.alert_email_custom else "Standard aus EB_ALERT_EMAIL"
+            parts.append(f"<p>Aktueller Notfallkontakt: <strong>{esc(', '.join(st.alert_email))}</strong> "
+                         f'<span class="muted">({source})</span></p>')
+        default = ", ".join(cfg.alert_email)
+        value = alert_value if alert_value is not None else ", ".join(st.alert_email) if st.alert_email_custom else ""
+        reset = (f"Leer lassen, um den Standard aus <code>EB_ALERT_EMAIL</code> zu verwenden ({esc(default)})."
+                 if default else "Ohne Eintrag geht keine Nachricht raus, weil <code>EB_ALERT_EMAIL</code> "
+                                 "nicht gesetzt ist.")
+        parts.append(f"""
+<form method="post" action="/settings/alert">
+  <label for="alert_email">Andere Adressen für den Notfallkontakt</label>
+  <input id="alert_email" name="alert_email" value="{esc(value)}" placeholder="{esc(default or 'ich@example.org')}">
+  <p class="hint">Mehrere Adressen durch Komma trennen. {reset}</p>
+  <button>Notfallkontakt speichern</button>
+</form>""")
+        if cfg.smtp_configured and st.alert_email:
+            parts.append('<form method="post" action="/settings/mail"><button>Test-Mail senden</button></form>')
+        return card("Benachrichtigung per E-Mail", "".join(parts))
+
+    def save_alert_email(self) -> None:
+        text = self.form.get("alert_email", "")
+        try:
+            addresses = settings.parse_emails(text)
+        except ValueError as exc:
+            return self.settings_page(error=str(exc), alert_value=text)
+        with self._storage() as storage:
+            storage.save_settings({settings.ALERT_KEY: ", ".join(addresses)})
+        if self.app.sync:
+            self.app.sync.retry_mail()
+        self._redirect("/settings?msg=alert")
 
     def test_mail(self) -> None:
         subject, body = mail.test_message(mail.public_url(self._redirect_url(self._settings())))
         try:
-            recipients = mail.send(self.app.cfg, subject, body)
+            recipients = mail.send(self.app.cfg, self._settings().alert_email, subject, body)
         except mail.MAIL_ERRORS as exc:
             log.error("Test-Mail fehlgeschlagen: %s", exc)
             return self.settings_page(error=f"Die Test-Mail konnte nicht gesendet werden: {exc}")

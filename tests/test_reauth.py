@@ -25,6 +25,9 @@ def _cfg(tmp_path, **overrides):
     return Config(**(values | overrides))
 
 
+receivers = []  # Empfänger der versendeten Nachrichten
+
+
 class FakeClient:
     def __init__(self, error=None):
         self.error = error
@@ -43,17 +46,19 @@ class FakeClient:
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
     sent = []
+    receivers.clear()
 
     def start(error=None, valid_until="2099-01-01T00:00:00+00:00", mail_error=None, **overrides):
         cfg = _cfg(tmp_path, **overrides)
         client = FakeClient(error)
         monkeypatch.setattr(settings, "make_client", lambda c, st: client)
 
-        def fake_send(c, subject, body):
+        def fake_send(c, recipients, subject, body):
             if mail_error:
                 raise mail_error
             sent.append((subject, body))
-            return ", ".join(c.alert_email)
+            receivers.append(recipients)
+            return ", ".join(recipients)
 
         monkeypatch.setattr(mail, "send", fake_send)
         with Storage(cfg.db_path) as s:
@@ -159,9 +164,8 @@ class FakeSMTP:
 def test_send_uses_configured_security(tmp_path, monkeypatch, security, cls, expect_tls):
     FakeSMTP.instances.clear()
     monkeypatch.setattr(mail.smtplib, cls, FakeSMTP)
-    cfg = _cfg(tmp_path, **(MAIL | {"smtp_security": security, "smtp_port": 2525,
-                                    "alert_email": ("a@example.org", "b@example.org")}))
-    assert mail.send(cfg, "Betreff", "Text") == "a@example.org, b@example.org"
+    cfg = _cfg(tmp_path, **(MAIL | {"smtp_security": security, "smtp_port": 2525}))
+    assert mail.send(cfg, ("a@example.org", "b@example.org"), "Betreff", "Text") == "a@example.org, b@example.org"
     smtp = FakeSMTP.instances[0]
     assert (smtp.host, smtp.port) == ("smtp.example.org", 2525)
     assert ("starttls" in smtp.actions) == expect_tls
@@ -171,7 +175,9 @@ def test_send_uses_configured_security(tmp_path, monkeypatch, security, cls, exp
 
 def test_send_requires_configuration(tmp_path):
     with pytest.raises(ConfigError, match="nicht eingerichtet"):
-        mail.send(_cfg(tmp_path), "x", "y")
+        mail.send(_cfg(tmp_path), ("a@example.org",), "x", "y")
+    with pytest.raises(ConfigError, match="Notfallkontakt"):
+        mail.send(_cfg(tmp_path, **MAIL), (), "x", "y")
 
 
 def test_smtp_settings_from_env(monkeypatch):
@@ -180,7 +186,7 @@ def test_smtp_settings_from_env(monkeypatch):
         monkeypatch.setenv(key, value)
     cfg = Config.from_env()
     assert (cfg.smtp_port, cfg.smtp_security) == (465, "ssl")
-    assert cfg.alert_email == ("a@example.org", "b@example.org") and cfg.mail_configured
+    assert cfg.alert_email == ("a@example.org", "b@example.org") and cfg.smtp_configured
 
     monkeypatch.delenv("EB_SMTP_PORT")
     monkeypatch.setenv("EB_SMTP_SECURITY", "none")
@@ -252,7 +258,7 @@ def test_reconnect_while_sending_does_not_restore_block(setup, monkeypatch):
     service.run_once()
     start = _since(cfg)
 
-    def send_and_reconnect(c, subject, body):
+    def send_and_reconnect(c, recipients, subject, body):
         with Storage(cfg.db_path) as s:
             clear_block(s)
         return "notfall@example.org"
@@ -289,7 +295,7 @@ def test_failed_mail_is_retried_hourly_and_not_counted(setup, monkeypatch):
 
     attempts = []
 
-    def send_after_failure(c, subject, body):
+    def send_after_failure(c, recipients, subject, body):
         attempts.append(subject)
         return "notfall@example.org"
 
@@ -403,3 +409,76 @@ def test_reschedule_uses_new_plan(setup):
         schedule.save(s, {key: ["03:15"] for key in schedule.DAY_KEYS})
     service.reschedule()
     assert service.next_run.astimezone().strftime("%H:%M") == "03:15"
+
+
+# --- Notfallkontakt ------------------------------------------------------------
+
+
+def _set_contact(cfg, value):
+    with Storage(cfg.db_path) as s:
+        s.save_settings({settings.ALERT_KEY: value})
+
+
+def test_default_recipient_comes_from_environment(setup):
+    cfg, _, _ = setup(REVOKED, **MAIL)
+    SyncService(cfg).run_once()
+    assert receivers == [("notfall@example.org",)]
+
+
+def test_custom_recipients_override_default(setup):
+    cfg, _, _ = setup(REVOKED, **MAIL)
+    _set_contact(cfg, "a@example.org, b@example.org")
+    SyncService(cfg).run_once()
+    assert receivers == [("a@example.org", "b@example.org")]
+    assert _block(cfg)["mail"] == "Benachrichtigung an a@example.org, b@example.org gesendet."
+
+
+def test_changed_recipients_apply_to_next_reminder(setup):
+    cfg, _, _ = setup(REVOKED, **MAIL)
+    service = SyncService(cfg)
+    service.run_once()
+    _set_contact(cfg, "neu@example.org")
+    service.send_due_reminder(_since(cfg) + timedelta(days=7))
+    assert receivers == [("notfall@example.org",), ("neu@example.org",)]
+
+
+def test_custom_recipients_work_without_environment_default(setup):
+    cfg, _, sent = setup(REVOKED, **(MAIL | {"alert_email": ()}))
+    _set_contact(cfg, "a@example.org")
+    SyncService(cfg).run_once()
+    assert receivers == [("a@example.org",)] and len(sent) == 1
+
+
+def test_contact_added_later_gets_due_message_without_waiting(setup):
+    cfg, _, sent = setup(REVOKED, **(MAIL | {"alert_email": ()}))
+    service = SyncService(cfg)
+    service.run_once()
+    assert sent == [] and "nicht eingerichtet" in _block(cfg)["mail"]
+    assert _block(cfg)["reminders"] == 0
+
+    _set_contact(cfg, "a@example.org")
+    service.send_due_reminder()
+    assert sent == []  # die Wartezeit läuft noch
+    service.retry_mail()
+    service.send_due_reminder()
+    assert receivers == [("a@example.org",)] and _block(cfg)["reminders"] == 1
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("", ()),
+    ("  ", ()),
+    ("a@example.org", ("a@example.org",)),
+    ("a@example.org, b@example.org;c@example.org d@example.org",
+     ("a@example.org", "b@example.org", "c@example.org", "d@example.org")),
+    ("a@example.org\nb@example.org", ("a@example.org", "b@example.org")),
+    ("a@example.org, A@EXAMPLE.org", ("a@example.org",)),
+])
+def test_parse_emails(text, expected):
+    assert settings.parse_emails(text) == expected
+
+
+@pytest.mark.parametrize("text", ["kein-adresse", "a@b", "@example.org", "a@", "a@@example.org",
+                                  "Name <a@example.org>", "a@example.org, falsch", "a@exam\x00ple.org"])
+def test_parse_emails_rejects_invalid(text):
+    with pytest.raises(ValueError, match="keine gültige E-Mail-Adresse"):
+        settings.parse_emails(text)

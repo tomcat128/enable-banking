@@ -6,6 +6,7 @@ Umgebungsvariable bzw. die per EB_PRIVATE_KEY_PATH eingebundene Schlüsseldatei.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
@@ -17,6 +18,10 @@ from .storage import Storage
 
 # Felder, die in der Weboberfläche bearbeitet werden können.
 FIELDS = ("application_id", "private_key", "redirect_url", "aspsp_country")
+# Eigene Adressen des Notfallkontakts; ohne Eintrag gilt EB_ALERT_EMAIL.
+ALERT_KEY = "alert_email"
+_ADDRESS_PART = r"[^@\s,;<>\"\x00-\x1f\x7f]+"
+_ADDRESS = re.compile(rf"{_ADDRESS_PART}@{_ADDRESS_PART}\.{_ADDRESS_PART}")
 
 
 @dataclass(frozen=True)
@@ -26,6 +31,8 @@ class Settings:
     private_key_source: str | None
     redirect_url: str | None
     aspsp_country: str
+    alert_email: tuple[str, ...] = ()
+    alert_email_custom: bool = False  # True: eigene Adressen statt EB_ALERT_EMAIL
 
     @property
     def complete(self) -> bool:
@@ -40,13 +47,28 @@ def load(cfg: Config, storage: Storage) -> Settings:
             key, source = cfg.private_key_path.read_text(), str(cfg.private_key_path)
         except OSError:
             key = source = None
+    custom = tuple(a.strip() for a in (db.get(ALERT_KEY) or "").split(",") if a.strip())
     return Settings(
         application_id=db.get("application_id") or cfg.application_id,
         private_key=key,
         private_key_source=source,
         redirect_url=db.get("redirect_url") or cfg.redirect_url,
         aspsp_country=db.get("aspsp_country") or cfg.aspsp_country,
+        alert_email=custom or cfg.alert_email,
+        alert_email_custom=bool(custom),
     )
+
+
+def parse_emails(text: str) -> tuple[str, ...]:
+    """Liest eine oder mehrere E-Mail-Adressen; wirft ValueError bei einer ungültigen Angabe."""
+    addresses: dict[str, str] = {}
+    for item in re.split(r"[,;\s]+", text.strip()):
+        if not item:
+            continue
+        if not _ADDRESS.fullmatch(item):
+            raise ValueError(f"„{item}“ ist keine gültige E-Mail-Adresse.")
+        addresses.setdefault(item.lower(), item)
+    return tuple(addresses.values())
 
 
 def make_client(cfg: Config, settings: Settings) -> EnableBankingClient:

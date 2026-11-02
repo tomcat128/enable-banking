@@ -67,6 +67,10 @@ class FakeSync:
     def __init__(self):
         self.triggered = 0
         self.rescheduled = 0
+        self.mail_retries = 0
+
+    def retry_mail(self):
+        self.mail_retries += 1
 
     def trigger(self):
         self.triggered += 1
@@ -466,7 +470,7 @@ MAIL = dict(smtp_host="smtp.example.org", smtp_user="bot@example.org", smtp_pass
 def test_send_test_mail(serve, monkeypatch):
     from enable_banking_sync import mail
     sent = []
-    monkeypatch.setattr(mail, "send", lambda cfg, subject, body: sent.append(subject) or "notfall@example.org")
+    monkeypatch.setattr(mail, "send", lambda cfg, recipients, subject, body: sent.append(subject) or ", ".join(recipients))
     site = serve(**MAIL)
     _, _, body = site.get("/settings")
     assert "notfall@example.org" in body and "smtp.example.org:587 (starttls)" in body and "pw<" not in body
@@ -704,3 +708,78 @@ def test_block_card_announces_next_reminder(serve):
 
 def test_mail_card_explains_reminders(serve):
     assert "Erinnerungen nach 7 und 14 Tagen" in serve(**MAIL_SETUP).get("/settings")[2]
+
+
+# --- Notfallkontakt ---------------------------------------------------------------
+
+
+def _restarted(serve, site):
+    """Neuer Server auf derselben Datenbank, wie nach einem Neustart oder neuem Container."""
+    return serve(**{k: getattr(site.cfg, k) for k in ("smtp_host", "smtp_user", "alert_email")})
+
+
+def test_alert_email_default_is_shown(serve):
+    _, _, body = serve(**MAIL).get("/settings")
+    assert "notfall@example.org" in body and "Standard aus EB_ALERT_EMAIL" in body
+    assert 'name="alert_email" value=""' in body
+    assert 'action="/settings/mail"' in body
+
+
+def test_alert_email_override_is_saved_and_reset(serve):
+    site = serve(**MAIL)
+    status, headers, _ = site.post("/settings/alert", {"alert_email": "a@example.org; b@example.org"})
+    assert status == 303 and headers["Location"] == "/settings?msg=alert"
+    assert site.sync.mail_retries == 1
+
+    _, _, body = site.get("/settings?msg=alert")
+    assert "Notfallkontakt gespeichert." in body and "eigene Adressen" in body
+    assert 'name="alert_email" value="a@example.org, b@example.org"' in body
+
+    site.post("/settings/alert", {"alert_email": ""})
+    _, _, body = site.get("/settings")
+    assert "Standard aus EB_ALERT_EMAIL" in body and 'name="alert_email" value=""' in body
+
+
+def test_invalid_alert_email_is_rejected_and_input_kept(serve):
+    site = serve(**MAIL)
+    site.post("/settings/alert", {"alert_email": "a@example.org"})
+    _, _, body = site.post("/settings/alert", {"alert_email": "a@example.org, <kaputt"})
+    assert "keine gültige E-Mail-Adresse" in body
+    assert 'value="a@example.org, &lt;kaputt"' in body
+    with Storage(site.cfg.db_path) as s:
+        assert s.settings()[settings.ALERT_KEY] == "a@example.org"
+
+
+def test_alert_email_can_be_entered_without_mail_setup(serve):
+    site = serve()
+    _, _, body = site.get("/settings")
+    assert "noch kein Notfallkontakt" in body and 'action="/settings/alert"' in body
+    assert 'action="/settings/mail"' not in body
+    site.post("/settings/alert", {"alert_email": "a@example.org"})
+    assert "a@example.org" in site.get("/settings")[2]
+
+
+def test_test_mail_goes_to_custom_addresses(serve, monkeypatch):
+    from enable_banking_sync import mail
+    monkeypatch.setattr(mail, "send", lambda cfg, recipients, subject, body: ", ".join(recipients))
+    site = serve(**MAIL)
+    site.post("/settings/alert", {"alert_email": "a@example.org, b@example.org"})
+    _, _, body = site.post("/settings/mail", {})
+    assert "Test-Mail an a@example.org, b@example.org gesendet" in body
+
+
+def test_alert_email_requires_login(serve):
+    site = serve(**LOGIN)
+    status, headers, _ = site.post("/settings/alert", {"alert_email": "boese@example.org"})
+    assert status == 303 and headers["Location"].startswith("/login")
+
+
+def test_schedule_and_alert_email_survive_restart(serve):
+    site = serve(**MAIL)
+    site.post("/settings/schedule", _times(mon="08:00, 17:30"))
+    site.post("/settings/alert", {"alert_email": "a@example.org, b@example.org"})
+
+    _, _, body = _restarted(serve, site).get("/settings")
+    assert 'name="times_mon" placeholder="kein Abruf" value="08:00, 17:30"' in body
+    assert 'name="times_tue" placeholder="kein Abruf" value=""' in body
+    assert 'name="alert_email" value="a@example.org, b@example.org"' in body

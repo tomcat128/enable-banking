@@ -89,10 +89,19 @@ versucht die Anwendung ihn stündlich erneut. Unter **Einstellungen** lässt sic
 EB_SMTP_HOST=smtp.example.org
 EB_SMTP_USER=banking@example.org     # zugleich Absender, falls EB_SMTP_FROM fehlt
 EB_SMTP_PASSWORD=...
-EB_ALERT_EMAIL=ich@example.org       # Notfallkontakt, mehrere durch Komma getrennt
+EB_ALERT_EMAIL=ich@example.org       # Standard für den Notfallkontakt, mehrere durch Komma getrennt
 ```
 
 Standard ist STARTTLS auf Port 587; mit `EB_SMTP_PORT=465` wird SSL/TLS verwendet.
+
+`EB_ALERT_EMAIL` ist der Standard für den Notfallkontakt. Unter **Einstellungen → Benachrichtigung per E-Mail**
+lassen sich stattdessen eine oder mehrere andere Adressen eintragen; sie gelten ab der nächsten Nachricht. Ein
+leeres Feld stellt den Standard wieder her.
+
+Abrufzeiten und eigene Adressen liegen wie die übrigen Einstellungen in der Datenbank im Datenverzeichnis. Sie
+bleiben deshalb bei einem Neustart und beim Neuerstellen von Container und Image erhalten, solange das
+Datenverzeichnis wie in der `docker-compose.yml` eingebunden ist. Einträge aus der Weboberfläche haben Vorrang
+vor der `.env`.
 
 ## Export für Skripte
 
@@ -166,7 +175,7 @@ Werte über eine `.env` (Vorlage: `.env.example`) vorbelegen; Einträge aus der 
 | `EB_SMTP_SECURITY` | `starttls` | `starttls`, `ssl` oder `none`; bei Port 465 automatisch `ssl` |
 | `EB_SMTP_USER`, `EB_SMTP_PASSWORD` | – | SMTP-Anmeldung |
 | `EB_SMTP_FROM` | `EB_SMTP_USER` | Absenderadresse |
-| `EB_ALERT_EMAIL` | – | Notfallkontakt, mehrere durch Komma getrennt |
+| `EB_ALERT_EMAIL` | – | Standard für den Notfallkontakt, mehrere durch Komma getrennt; in der Oberfläche überschreibbar |
 | `EB_LOG_LEVEL` | `INFO` | Log-Level |
 
 Nur für `docker compose` (Host-Seite): `EB_DATA_PATH` (Datenverzeichnis, Standard `./data`),

@@ -71,6 +71,7 @@ class Config:
     export_user: str | None = None
     export_password: str | None = None
     # Benachrichtigung per E-Mail, wenn die Bank eine erneute Anmeldung verlangt.
+    # alert_email ist der Standard; in der Weboberfläche lassen sich andere Adressen eintragen.
     smtp_host: str | None = None
     smtp_port: int = 587
     smtp_security: str = "starttls"
@@ -92,8 +93,8 @@ class Config:
         return bool(self.export_user and self.export_password)
 
     @property
-    def mail_configured(self) -> bool:
-        return bool(self.smtp_host and self.alert_email and (self.smtp_from or self.smtp_user))
+    def smtp_configured(self) -> bool:
+        return bool(self.smtp_host and (self.smtp_from or self.smtp_user))
 
     @classmethod
     def from_env(cls) -> "Config":

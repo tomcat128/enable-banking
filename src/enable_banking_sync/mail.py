@@ -1,4 +1,4 @@
-"""E-Mail-Benachrichtigung an den Notfallkontakt (EB_ALERT_EMAIL) über SMTP."""
+"""E-Mail-Benachrichtigung an den Notfallkontakt über SMTP."""
 
 from __future__ import annotations
 
@@ -21,15 +21,17 @@ FOLLOW_UPS = " und ".join(str(days) for days in REMINDER_DAYS[1:])
 MAIL_ERRORS = (smtplib.SMTPException, OSError, ConfigError)
 
 
-def send(cfg: Config, subject: str, body: str) -> str:
-    """Versendet eine Nachricht an den Notfallkontakt und gibt die Empfänger zurück."""
-    if not cfg.mail_configured:
-        raise ConfigError("Der Mailversand ist nicht eingerichtet (EB_SMTP_HOST, EB_SMTP_FROM bzw. "
-                          "EB_SMTP_USER und EB_ALERT_EMAIL setzen).")
+def send(cfg: Config, recipients: tuple[str, ...], subject: str, body: str) -> str:
+    """Versendet eine Nachricht an die Empfänger und gibt sie als Text zurück."""
+    if not cfg.smtp_configured:
+        raise ConfigError("Der Mailversand ist nicht eingerichtet (EB_SMTP_HOST und EB_SMTP_FROM bzw. "
+                          "EB_SMTP_USER setzen).")
+    if not recipients:
+        raise ConfigError("Der Mailversand ist nicht eingerichtet, es fehlt ein Notfallkontakt.")
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = cfg.smtp_from or cfg.smtp_user
-    msg["To"] = ", ".join(cfg.alert_email)
+    msg["To"] = ", ".join(recipients)
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid()
     msg.set_content(body)
