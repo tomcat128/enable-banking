@@ -22,7 +22,7 @@ def _cfg(tmp_path: Path, **overrides) -> Config:
     values = dict(
         application_id=None, private_key_path=tmp_path / "missing.pem", api_base="http://x",
         redirect_url=None, aspsp_name=None, aspsp_country="DE", psu_type="personal",
-        access_days=180, data_dir=tmp_path, fetch_interval=3600, initial_days=90,
+        access_days=180, data_dir=tmp_path, initial_days=90,
         overlap_days=10, web_host="127.0.0.1", web_port=0,
     )
     return Config(**(values | overrides))
@@ -66,9 +66,13 @@ class FakeSync:
 
     def __init__(self):
         self.triggered = 0
+        self.rescheduled = 0
 
     def trigger(self):
         self.triggered += 1
+
+    def reschedule(self):
+        self.rescheduled += 1
 
 
 class Site:
@@ -427,7 +431,7 @@ def test_export_page_describes_basic_auth(serve):
 def _set_block(site):
     from enable_banking_sync.sync import set_block
     with Storage(site.cfg.db_path) as s:
-        set_block(s, "Die Bank verlangt eine erneute Anmeldung (EXPIRED_SESSION).", "Benachrichtigung gesendet.")
+        set_block(s, "Die Bank verlangt eine erneute Anmeldung (EXPIRED_SESSION).")
 
 
 def test_index_shows_block_and_resume_clears_it(serve):
@@ -616,3 +620,87 @@ def test_callback_with_invalid_code_shows_error(serve):
     status, _, body = site.post("/callback", {"url": "bad"})
     assert status == 200 and "Die Verbindung konnte nicht hergestellt werden" in body
     assert site.sync.triggered == 0
+
+
+# --- Abrufzeiten und Erinnerungen ------------------------------------------------
+
+
+def _times(**days):
+    return {f"times_{key}": value for key, value in days.items()}
+
+
+def test_settings_show_default_schedule(serve):
+    site = serve()
+    _, _, body = site.get("/settings")
+    assert 'action="/settings/schedule"' in body
+    for name in ("Montag", "Samstag", "Sonntag"):
+        assert name in body
+    assert 'name="times_sun" placeholder="kein Abruf" value="12:00"' in body
+    assert "Automatisch: täglich 12:00." in site.get("/")[2]
+
+
+def test_save_schedule_with_free_weekend(serve):
+    site = serve()
+    workday = "8:00, 12:30"
+    status, headers, _ = site.post("/settings/schedule", _times(
+        mon=workday, tue=workday, wed=workday, thu=workday, fri=workday, sat="", sun=""))
+    assert status == 303 and headers["Location"] == "/settings?msg=schedule"
+    assert site.sync.rescheduled == 1
+
+    _, _, body = site.get("/settings?msg=schedule")
+    assert "Abrufzeiten gespeichert." in body
+    assert 'name="times_mon" placeholder="kein Abruf" value="08:00, 12:30"' in body
+    assert 'name="times_sat" placeholder="kein Abruf" value=""' in body
+    assert "Automatisch: Mo–Fr 08:00, 12:30." in site.get("/")[2]
+
+
+def test_save_empty_schedule_turns_automatic_fetch_off(serve):
+    site = serve()
+    site.post("/settings/schedule", {})
+    assert "Es ist kein automatischer Abruf eingeplant." in site.get("/")[2]
+    assert 'name="times_mon" placeholder="kein Abruf" value=""' in site.get("/settings")[2]
+
+
+def test_invalid_schedule_is_rejected_and_input_kept(serve):
+    site = serve()
+    _, _, body = site.post("/settings/schedule", _times(mon="08:00", tue="25:00", wed="<b>"))
+    assert "Dienstag:" in body and "25:00" in body and "keine gültige Uhrzeit" in body
+    assert 'name="times_mon" placeholder="kein Abruf" value="08:00"' in body
+    assert "<b>" not in body.split("<form", 1)[1]
+    assert site.sync.rescheduled == 0
+    assert "Automatisch: täglich 12:00." in site.get("/")[2]  # nichts gespeichert
+
+
+def test_schedule_warns_above_bank_limit(serve):
+    site = serve()
+    assert "mehr als 4 Abrufe" not in site.get("/settings")[2]
+    site.post("/settings/schedule", _times(mon="8, 10, 12, 14, 16"))
+    assert "mehr als 4 Abrufe" in site.get("/settings")[2]
+
+
+def test_schedule_requires_login(serve):
+    site = serve(**LOGIN)
+    status, headers, _ = site.post("/settings/schedule", _times(mon="03:00"))
+    assert status == 303 and headers["Location"].startswith("/login")
+    with Storage(site.cfg.db_path) as s:
+        assert "fetch_schedule" not in s.settings()
+
+
+MAIL_SETUP = dict(smtp_host="smtp.example.org", smtp_user="bot@example.org", alert_email=("a@example.org",))
+
+
+def test_block_card_announces_next_reminder(serve):
+    from enable_banking_sync.sync import BLOCK_KEY, get_block
+    site = serve(**MAIL_SETUP)
+    _set_block(site)
+    with Storage(site.cfg.db_path) as s:
+        block = get_block(s) | {"mail": "Benachrichtigung an a@example.org gesendet.", "reminders": 1}
+        s.save_settings({BLOCK_KEY: json.dumps(block)})
+    assert "Nächste Erinnerung:" in site.get("/")[2]
+    with Storage(site.cfg.db_path) as s:
+        s.save_settings({BLOCK_KEY: json.dumps(block | {"reminders": 3})})
+    assert "Es folgen keine weiteren Erinnerungen." in site.get("/")[2]
+
+
+def test_mail_card_explains_reminders(serve):
+    assert "Erinnerungen nach 7 und 14 Tagen" in serve(**MAIL_SETUP).get("/settings")[2]

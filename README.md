@@ -2,8 +2,8 @@
 
 Ruft Kontoumsätze und Salden automatisiert über die [Enable Banking API](https://enablebanking.com/docs/api/reference/)
 ab und speichert sie lokal in einer SQLite-Datenbank. Alles läuft in einem einzigen Docker-Container mit
-Weboberfläche: Einrichtung, Bankverbindung, Abruf und Export. Der Container ruft außerdem periodisch
-(Standard: alle 6 Stunden) neue Umsätze ab.
+Weboberfläche: Einrichtung, Bankverbindung, Abruf und Export. Der Container ruft außerdem zu festen
+Uhrzeiten (Standard: täglich um 12:00 Uhr) neue Umsätze ab.
 
 ## Schnellstart
 
@@ -60,23 +60,30 @@ Die Formate:
 
 ## Automatischer Abruf
 
-Der Abruf läuft im selben Container, ein Cron-Job ist nicht nötig. Er findet jeweils
-`EB_FETCH_INTERVAL_SECONDS` (Standard 6 Stunden) nach dem letzten Abruf statt; **Jetzt abrufen** in der
-Übersicht startet ihn sofort.
+Der Abruf läuft im selben Container, ein Cron-Job ist nicht nötig. Die Uhrzeiten stehen unter
+**Einstellungen → Abrufzeiten** und lassen sich je Wochentag festlegen, mehrere Uhrzeiten durch Komma
+getrennt. Ein leeres Feld bedeutet: an diesem Tag kein Abruf, so lassen sich Nächte und Wochenenden
+auslassen. Ohne eigene Einstellung wird täglich um 12:00 Uhr abgerufen. **Jetzt abrufen** in der Übersicht
+startet einen Abruf sofort. Mit mehr als 4 Uhrzeiten pro Tag warnt die Seite, weil Banken ohne erneute
+Anmeldung (PSD2) häufig nur 4 Abrufe pro Tag und Konto erlauben.
 
-Der Zeitpunkt des letzten Abrufs steht in der Datenbank im Datenverzeichnis. Ein Neustart oder das
-Neuerstellen von Container und Image (z. B. bei einem Update) löst deshalb keinen zusätzlichen Abruf aus:
-Liegt der letzte Abruf weniger als ein Intervall zurück, wartet der Container den Rest ab. Das ist wichtig,
-weil Banken ohne erneute Anmeldung (PSD2) häufig nur 4 Abrufe pro Tag und Konto erlauben. Voraussetzung
-ist, dass das Datenverzeichnis wie in der `docker-compose.yml` eingebunden ist.
+Die Uhrzeiten gelten in der Zeitzone aus `TZ`, im Container standardmäßig `Europe/Berlin`. Sie lässt sich in
+der `.env` ändern.
+
+Ein Neustart oder das Neuerstellen von Container und Image (z. B. bei einem Update) löst keinen zusätzlichen
+Abruf aus; es gilt die nächste eingetragene Uhrzeit. Nur wenn noch nie abgerufen wurde, startet der Abruf
+sofort, sobald eine Bank verbunden ist. Eine verpasste Uhrzeit, etwa weil der Server aus war, wird nicht
+nachgeholt. Der nächste Abruf holt die fehlenden Umsätze mit ab (`EB_OVERLAP_DAYS`).
 
 Verlangt die Bank eine erneute Anmeldung (Freigabe abgelaufen oder widerrufen, API-Fehler wie
 `EXPIRED_SESSION`, `REVOKED_SESSION` oder `ASPSP_PSU_ACTION_REQUIRED`), stoppt der automatische Abruf und
 unternimmt keine weiteren Versuche, auch nicht nach einem Neustart. Die Übersicht zeigt das an. Er läuft
 wieder, sobald die Bank neu verbunden oder er dort mit **Abruf trotzdem wieder freigeben** freigegeben wird.
 
-Ist der Mailversand eingerichtet, erhält der Notfallkontakt in diesem Fall eine E-Mail mit Link zum
-Neuverbinden. Unter **Einstellungen** lässt sich eine Test-Mail senden.
+Ist der Mailversand eingerichtet, erhält der Notfallkontakt in diesem Fall insgesamt höchstens 3 E-Mails
+mit Link zum Neuverbinden: sofort sowie 7 und 14 Tage nach der ersten Anfrage der Bank. Sobald die Bank neu
+verbunden oder der Abruf freigegeben ist, entfallen die noch offenen Erinnerungen. Schlägt der Versand fehl,
+versucht die Anwendung ihn stündlich erneut. Unter **Einstellungen** lässt sich eine Test-Mail senden.
 
 ```bash
 EB_SMTP_HOST=smtp.example.org
@@ -148,7 +155,7 @@ Werte über eine `.env` (Vorlage: `.env.example`) vorbelegen; Einträge aus der 
 | `EB_ASPSP_COUNTRY` | `DE` | Vorbelegung des Landes |
 | `EB_PSU_TYPE` | `personal` | Vorbelegung der Kontoart (`personal` oder `business`) |
 | `EB_ACCESS_DAYS` | `180` | Gewünschte Gültigkeit der Freigabe (wird auf das Maximum der Bank begrenzt) |
-| `EB_FETCH_INTERVAL_SECONDS` | `21600` | Abrufintervall |
+| `TZ` | `Europe/Berlin` | Zeitzone der Abrufzeiten und der Anzeige |
 | `EB_INITIAL_DAYS` | `90` | Zeitraum des ersten Abrufs |
 | `EB_OVERLAP_DAYS` | `10` | Überlappung bei Folgeabrufen |
 | `EB_WEB_USER`, `EB_WEB_PASSWORD` | – | Login der Oberfläche (nur aktiv, wenn beide gesetzt) |

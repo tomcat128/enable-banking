@@ -19,11 +19,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
-from . import export, mail, settings
+from . import export, mail, schedule, settings
 from .client import ApiError
 from .config import Config, ConfigError
 from .storage import Storage
-from .sync import SyncService, _parse_ts, clear_block, get_block
+from .sync import SyncService, _parse_ts, clear_block, get_block, next_reminder
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ MONTHS = ("Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August"
 
 MESSAGES = {
     "saved": "Einstellungen gespeichert.",
+    "schedule": "Abrufzeiten gespeichert.",
     "connected": "Bank verbunden. Der erste Abruf läuft.",
     "fetch": "Abruf gestartet.",
     "setup": "Bitte zuerst Application ID und privaten Schlüssel eintragen.",
@@ -327,6 +328,7 @@ class Handler(BaseHTTPRequestHandler):
         ("GET", "/settings"): "settings_page",
         ("POST", "/settings"): "save_settings",
         ("POST", "/settings/test"): "test_connection",
+        ("POST", "/settings/schedule"): "save_schedule",
         ("GET", "/connect"): "connect_page",
         ("POST", "/connect"): "start_connect",
         ("GET", "/callback"): "callback",
@@ -449,6 +451,7 @@ class Handler(BaseHTTPRequestHandler):
             recent = s.recent_transactions(10)
             block = get_block(s)
             last_fetch = s.last_fetch()
+            plan = schedule.load(s)
 
         parts = []
         if not st.complete:
@@ -457,7 +460,7 @@ class Handler(BaseHTTPRequestHandler):
                 "privaten Schlüssel deiner Enable-Banking-Anwendung ein.</p>"
                 '<a class="button" href="/settings">Zu den Einstellungen</a>')))
         parts.append(self._session_card(session, st))
-        parts.append(self._block_card(block) if block else self._sync_card(session, last_fetch))
+        parts.append(self._block_card(block) if block else self._sync_card(session, last_fetch, plan))
         if accounts:
             parts.append(self._accounts_card(accounts))
         parts.append(self._recent_card(recent, total))
@@ -488,12 +491,25 @@ class Handler(BaseHTTPRequestHandler):
             f"ist{since} gestoppt; es werden keine weiteren Versuche unternommen.</p>"
             f"<p>{esc(block.get('reason'))}</p>"
             + (f'<p class="muted">{esc(block["mail"])}</p>' if block.get("mail") else "")
+            + self._reminder_note(block)
             + '<div class="buttons" style="margin-top:1rem"><a class="button" href="/connect">Bank neu verbinden</a>'
             '<form method="post" action="/fetch/resume"><button class="secondary">Abruf trotzdem wieder '
             "freigeben</button></form></div>"
             '<p class="hint">Nach dem Neuverbinden läuft der Abruf automatisch wieder.</p>'))
 
-    def _sync_card(self, session, last_fetch: str | None) -> str:
+    def _reminder_note(self, block: dict) -> str:
+        if not self.app.cfg.mail_configured:
+            return ""
+        following = next_reminder(block)
+        if following is None:
+            text = "Es folgen keine weiteren Erinnerungen."
+        elif following > datetime.now(timezone.utc):
+            text = f"Nächste Erinnerung: {moment(following)}. Nach dem Neuverbinden entfällt sie."
+        else:
+            text = "Der Versand wird stündlich erneut versucht."
+        return f'<p class="muted">{esc(text)}</p>'
+
+    def _sync_card(self, session, last_fetch: str | None, plan: dict[str, list[str]]) -> str:
         sync = self.app.sync
         if sync is None:
             return card("Abruf", "<p class=\"muted\">Der automatische Abruf läuft in diesem Prozess nicht.</p>")
@@ -507,11 +523,12 @@ class Handler(BaseHTTPRequestHandler):
         if sync.next_run and not sync.busy:
             lines.append(f'<p class="muted">Nächster automatischer Abruf: {moment(sync.next_run)}</p>')
         disabled = " disabled" if sync.busy or not session else ""
-        hours = self.app.cfg.fetch_interval / 3600
+        times = schedule.describe(plan)
+        planned = f"Automatisch: {times}." if times else "Es ist kein automatischer Abruf eingeplant."
         lines.append(
             f'<form method="post" action="/fetch"><button{disabled}>Jetzt abrufen</button></form>'
-            f'<p class="hint">Automatisch alle {hours:g} Stunden. Banken erlauben ohne erneute Anmeldung '
-            "oft nur 4 Abrufe pro Tag und Konto.</p>")
+            f'<p class="hint">{esc(planned)} Die Zeiten lassen sich unter '
+            '<a href="/settings">Einstellungen</a> ändern.</p>')
         return card("Abruf", "".join(lines))
 
     def _accounts_card(self, accounts) -> str:
@@ -542,7 +559,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- Einstellungen -----------------------------------------------------
 
-    def settings_page(self, *, error: str = "", values: dict | None = None, result: str = "") -> None:
+    def settings_page(self, *, error: str = "", values: dict | None = None, result: str = "",
+                      schedule_values: dict[str, str] | None = None) -> None:
         st = self._settings()
         v = values or {
             "application_id": st.application_id, "redirect_url": st.redirect_url,
@@ -588,12 +606,50 @@ class Handler(BaseHTTPRequestHandler):
 <form method="post" action="/settings/test"><button>Verbindung testen</button></form>"""
         self._page("Einstellungen",
                    card("Zugangsdaten", form) + result + card("Control Panel", urls)
-                   + self._mail_card(), error=error)
+                   + self._schedule_card(schedule_values) + self._mail_card(), error=error)
+
+    def _schedule_card(self, values: dict[str, str] | None) -> str:
+        with self._storage() as storage:
+            plan = schedule.load(storage)
+        rows = "".join(
+            f'<tr><th><label for="times_{key}">{label}</label></th><td><input id="times_{key}" '
+            f'name="times_{key}" placeholder="kein Abruf" '
+            f'value="{esc(values[key] if values else ", ".join(plan[key]))}"></td></tr>'
+            for key, label in schedule.DAYS)
+        warning = (f'<p class="warn">An mindestens einem Tag sind mehr als {schedule.BANK_DAILY_LIMIT} Abrufe '
+                   "eingetragen. Banken erlauben ohne erneute Anmeldung oft nur "
+                   f"{schedule.BANK_DAILY_LIMIT} Abrufe pro Tag und Konto.</p>"
+                   if schedule.over_limit(plan) else "")
+        return card("Abrufzeiten", f"""
+<p>Zu diesen Uhrzeiten ruft die Anwendung neue Umsätze bei der Bank ab. Mehrere Uhrzeiten durch Komma trennen;
+  ein leeres Feld bedeutet: an diesem Tag kein Abruf.</p>
+{warning}
+<form method="post" action="/settings/schedule">
+  <div class="table"><table>{rows}</table></div>
+  <button>Abrufzeiten speichern</button>
+</form>
+<p class="hint">Zeitzone des Servers: {esc(datetime.now().astimezone().tzname())}. Eine verpasste Uhrzeit, etwa
+  weil der Server aus war, wird nicht nachgeholt.</p>""")
+
+    def save_schedule(self) -> None:
+        texts = {key: self.form.get(f"times_{key}", "") for key in schedule.DAY_KEYS}
+        plan = {}
+        for key, label in schedule.DAYS:
+            try:
+                plan[key] = schedule.parse_times(texts[key])
+            except ValueError as exc:
+                return self.settings_page(error=f"{label}: {exc}", schedule_values=texts)
+        with self._storage() as storage:
+            schedule.save(storage, plan)
+        if self.app.sync:
+            self.app.sync.reschedule()
+        self._redirect("/settings?msg=schedule")
 
     def _mail_card(self) -> str:
         cfg = self.app.cfg
         intro = ("<p>Verlangt die Bank eine erneute Anmeldung, stoppt der automatische Abruf und der "
-                 "Notfallkontakt erhält eine E-Mail.</p>")
+                 "Notfallkontakt erhält sofort eine E-Mail. Ist die Bank dann noch nicht neu verbunden, "
+                 f"folgen Erinnerungen nach {mail.FOLLOW_UPS} Tagen, danach keine weiteren.</p>")
         if not cfg.mail_configured:
             return card("Benachrichtigung per E-Mail", intro + (
                 '<p class="warn">Der Mailversand ist nicht eingerichtet.</p><p class="hint">In der <code>.env</code> '

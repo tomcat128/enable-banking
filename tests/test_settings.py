@@ -3,14 +3,14 @@ import pytest
 from enable_banking_sync import settings
 from enable_banking_sync.config import Config, ConfigError
 from enable_banking_sync.storage import Storage
-from enable_banking_sync.sync import NO_SESSION_RETRY, SyncService
+from enable_banking_sync.sync import SyncService
 
 
 def _cfg(tmp_path, **overrides):
     values = dict(
         application_id="env-app", private_key_path=tmp_path / "key.pem", api_base="http://x",
         redirect_url="https://env.example/callback", aspsp_name=None, aspsp_country="DE",
-        psu_type="personal", access_days=180, data_dir=tmp_path, fetch_interval=3600,
+        psu_type="personal", access_days=180, data_dir=tmp_path,
         initial_days=90, overlap_days=10,
     )
     return Config(**(values | overrides))
@@ -59,22 +59,25 @@ def _log_run(cfg, hours_ago):
         s.log_run("u1", started.isoformat(timespec="seconds"), None, None, 0, 0)
 
 
-def test_first_fetch_after_start_respects_last_fetch_in_database(tmp_path):
-    cfg = _cfg(tmp_path, fetch_interval=6 * 3600)
+def test_first_fetch_after_start_follows_schedule(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    cfg = _cfg(tmp_path)
     service = SyncService(cfg)
-    assert service.initial_delay() == 0  # noch nie abgerufen: sofort
+    assert service.first_run() <= datetime.now(timezone.utc)  # noch nie abgerufen: sofort
 
-    _log_run(cfg, hours_ago=7)
-    assert service.initial_delay() == 0  # Intervall abgelaufen: sofort
-
-    _log_run(cfg, hours_ago=1)  # z. B. vor dem Neuerstellen des Containers
-    assert 5 * 3600 - 5 <= SyncService(cfg).initial_delay() <= 5 * 3600
+    # Auch nach langer Pause (z. B. Server war aus) kein Nachholen außerhalb des Zeitplans.
+    _log_run(cfg, hours_ago=24 * 30)
+    planned = SyncService(cfg).first_run()
+    assert planned > datetime.now(timezone.utc)
+    assert planned - datetime.now(timezone.utc) <= timedelta(days=1)
+    assert planned.astimezone().strftime("%H:%M") == "12:00"
 
 
 def test_sync_service_waits_briefly_without_setup(tmp_path):
     service = SyncService(_cfg(tmp_path, application_id=None))
     service.trigger()
     assert service.busy
-    assert service.run_once() == NO_SESSION_RETRY
+    from datetime import datetime, timedelta, timezone
+    assert service.run_once() - datetime.now(timezone.utc) <= timedelta(minutes=1)
     assert not service.busy
     assert "Application ID" in service.last_error

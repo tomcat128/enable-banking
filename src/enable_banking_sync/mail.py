@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import smtplib
 import ssl
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from urllib.parse import urlsplit
@@ -12,6 +12,10 @@ from urllib.parse import urlsplit
 from .config import Config, ConfigError
 
 TIMEOUT = 30
+
+# Benachrichtigungen bei nötiger Bank-Anmeldung: Tage nach der ersten Anfrage der Bank.
+REMINDER_DAYS = (0, 7, 14)
+FOLLOW_UPS = " und ".join(str(days) for days in REMINDER_DAYS[1:])
 
 # Fehler, die beim Versand auftreten können (Verbindung, TLS, Anmeldung, Ablehnung).
 MAIL_ERRORS = (smtplib.SMTPException, OSError, ConfigError)
@@ -50,9 +54,13 @@ def public_url(redirect_url: str | None) -> str | None:
     return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else None
 
 
-def reauth_message(bank: str | None, reason: str, base_url: str | None) -> tuple[str, str]:
+def reauth_message(bank: str | None, reason: str, base_url: str | None, index: int = 0,
+                   since: datetime | None = None) -> tuple[str, str]:
+    """Text der Benachrichtigung; index ist die Position in REMINDER_DAYS (0 = erste Nachricht)."""
     link = (f"Bitte die Bank in der Weboberfläche neu verbinden:\n{base_url}/connect\n" if base_url
             else "Bitte die Bank in der Weboberfläche unter „Bank verbinden“ neu verbinden.\n")
+    if index > 0:
+        return _reminder(bank, reason, link, index, since)
     body = (
         "Hallo,\n\n"
         "der automatische Abruf der Kontoumsätze wurde gestoppt, weil die Bank eine erneute "
@@ -63,9 +71,32 @@ def reauth_message(bank: str | None, reason: str, base_url: str | None) -> tuple
         "Bis die Bank neu verbunden oder der Abruf in der Weboberfläche wieder freigegeben wird, "
         "unternimmt die Anwendung keine weiteren Abrufversuche.\n\n"
         f"{link}\n"
+        f"Ohne neue Verbindung folgen Erinnerungen nach {FOLLOW_UPS} Tagen, danach keine weiteren.\n\n"
         "Diese Nachricht wurde automatisch von enable-banking-sync versendet.\n"
     )
     return "Enable Banking: Bitte Bank neu verbinden", body
+
+
+def _reminder(bank: str | None, reason: str, link: str, index: int, since: datetime | None) -> tuple[str, str]:
+    total = len(REMINDER_DAYS)
+    if index + 1 < total and since:
+        following = since + timedelta(days=REMINDER_DAYS[index + 1])
+        outlook = f"Ohne neue Verbindung folgt am {following.astimezone():%d.%m.%Y} eine weitere Erinnerung.\n"
+    else:
+        outlook = "Dies ist die letzte Erinnerung, es folgen keine weiteren.\n"
+    stopped = f"{since.astimezone():%d.%m.%Y %H:%M}" if since else "unbekannt"
+    body = (
+        "Hallo,\n\n"
+        "der automatische Abruf der Kontoumsätze ist weiterhin gestoppt, weil die Bank eine erneute "
+        "Anmeldung verlangt.\n\n"
+        f"Bank:          {bank or 'unbekannt'}\n"
+        f"Gestoppt seit: {stopped}\n"
+        f"Meldung:       {reason}\n\n"
+        f"{link}\n"
+        f"{outlook}\n"
+        "Diese Nachricht wurde automatisch von enable-banking-sync versendet.\n"
+    )
+    return f"Enable Banking: Bitte Bank neu verbinden (Erinnerung {index + 1} von {total})", body
 
 
 def test_message(base_url: str | None) -> tuple[str, str]:

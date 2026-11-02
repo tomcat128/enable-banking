@@ -15,7 +15,8 @@ RUN useradd --create-home --uid 1000 app \
     && chown app:app /data
 USER app
 
-ENV EB_DATA_DIR=/data \
+ENV TZ=Europe/Berlin \
+    EB_DATA_DIR=/data \
     EB_PRIVATE_KEY_PATH=/secrets/private.pem
 VOLUME ["/data"]
 EXPOSE 8080

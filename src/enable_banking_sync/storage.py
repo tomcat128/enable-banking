@@ -183,6 +183,11 @@ class Storage:
                 else:
                     self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
 
+    def update_setting(self, key: str, value: str) -> None:
+        """Ändert nur einen vorhandenen Eintrag; ein inzwischen entfernter bleibt entfernt."""
+        with self.conn:
+            self.conn.execute("UPDATE settings SET value = ? WHERE key = ?", (value, key))
+
     # --- Sessions & Konten -------------------------------------------------
 
     def save_session(self, session: dict) -> None:

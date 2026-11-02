@@ -1,12 +1,15 @@
 """Sperre des automatischen Abrufs bei erneuter Bank-Anmeldung und E-Mail-Benachrichtigung."""
 
+import json
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
-from enable_banking_sync import mail, settings
+from enable_banking_sync import mail, schedule, settings
 from enable_banking_sync.client import ApiError
 from enable_banking_sync.config import Config, ConfigError
 from enable_banking_sync.storage import Storage
-from enable_banking_sync.sync import SyncService, clear_block, get_block
+from enable_banking_sync.sync import SyncService, clear_block, get_block, next_reminder
 
 MAIL = dict(smtp_host="smtp.example.org", smtp_user="bot@example.org", smtp_password="pw",
             alert_email=("notfall@example.org",))
@@ -16,7 +19,7 @@ def _cfg(tmp_path, **overrides):
     values = dict(
         application_id="app", private_key_path=tmp_path / "key.pem", api_base="http://x",
         redirect_url="https://bank.example.org/callback", aspsp_name=None, aspsp_country="DE",
-        psu_type="personal", access_days=180, data_dir=tmp_path, fetch_interval=3600,
+        psu_type="personal", access_days=180, data_dir=tmp_path,
         initial_days=90, overlap_days=10,
     )
     return Config(**(values | overrides))
@@ -91,7 +94,7 @@ def test_reauth_error_blocks_fetch_and_notifies(setup):
         assert clear_block(s)
         assert not clear_block(s)
     client.error = None
-    assert service.run_once() == cfg.fetch_interval
+    assert service.run_once() is not None
     assert client.calls == ["u1", "u1", "u2"]
 
 
@@ -106,7 +109,7 @@ def test_expired_consent_blocks_without_api_call(setup):
 def test_other_errors_do_not_block(setup, code):
     cfg, client, sent = setup(ApiError(429, "nope", {"error": code} if code else None), **MAIL)
     service = SyncService(cfg)
-    assert service.run_once() == cfg.fetch_interval
+    assert service.run_once() is not None
     assert _block(cfg) is None and sent == []
     assert client.calls == ["u1", "u2"]
     assert "mindestens ein Konto" in service.last_error
@@ -190,3 +193,213 @@ def test_smtp_settings_from_env(monkeypatch):
 def test_public_url():
     assert mail.public_url("https://bank.example.org/callback") == "https://bank.example.org"
     assert mail.public_url(None) is None and mail.public_url("kaputt") is None
+
+
+# --- Erinnerungen --------------------------------------------------------------
+
+REVOKED = ApiError(403, "revoked", {"error": "REVOKED_SESSION"})
+
+
+def _since(cfg):
+    return datetime.fromisoformat(_block(cfg)["since"])
+
+
+def test_reminders_after_7_and_14_days_then_none(setup):
+    cfg, _, sent = setup(REVOKED, **MAIL)
+    service = SyncService(cfg)
+    service.run_once()
+    start = _since(cfg)
+    assert len(sent) == 1 and "Erinnerung" not in sent[0][0]
+    assert "nach 7 und 14 Tagen" in sent[0][1]
+
+    service.send_due_reminder(start + timedelta(days=6, hours=23))
+    assert len(sent) == 1
+
+    service.send_due_reminder(start + timedelta(days=7))
+    service.send_due_reminder(start + timedelta(days=7, hours=1))  # nicht doppelt
+    assert len(sent) == 2
+    assert "Erinnerung 2 von 3" in sent[1][0] and "weiterhin gestoppt" in sent[1][1]
+    assert "Testbank" in sent[1][1] and "https://bank.example.org/connect" in sent[1][1]
+    assert f"{(start + timedelta(days=14)).astimezone():%d.%m.%Y}" in sent[1][1]
+    assert _block(cfg)["mail"] == "Erinnerung 2 von 3 an notfall@example.org gesendet."
+
+    service.send_due_reminder(start + timedelta(days=13, hours=23))
+    assert len(sent) == 2
+    service.send_due_reminder(start + timedelta(days=14))
+    assert len(sent) == 3
+    assert "Erinnerung 3 von 3" in sent[2][0] and "letzte Erinnerung" in sent[2][1]
+    assert next_reminder(_block(cfg)) is None
+
+    service.send_due_reminder(start + timedelta(days=60))
+    assert len(sent) == 3
+
+
+def test_no_reminder_after_authorization(setup):
+    cfg, _, sent = setup(REVOKED, **MAIL)
+    service = SyncService(cfg)
+    service.run_once()
+    start = _since(cfg)
+    with Storage(cfg.db_path) as s:
+        assert clear_block(s)
+    service.send_due_reminder(start + timedelta(days=7))
+    service.tick(start + timedelta(days=14))
+    assert len(sent) == 1
+
+
+def test_reconnect_while_sending_does_not_restore_block(setup, monkeypatch):
+    cfg, _, sent = setup(REVOKED, **MAIL)
+    service = SyncService(cfg)
+    service.run_once()
+    start = _since(cfg)
+
+    def send_and_reconnect(c, subject, body):
+        with Storage(cfg.db_path) as s:
+            clear_block(s)
+        return "notfall@example.org"
+
+    monkeypatch.setattr(mail, "send", send_and_reconnect)
+    service.send_due_reminder(start + timedelta(days=7))
+    assert _block(cfg) is None
+
+
+def test_only_latest_reminder_after_downtime(setup):
+    cfg, _, sent = setup(REVOKED, **MAIL)
+    service = SyncService(cfg)
+    service.run_once()
+    service = SyncService(cfg)  # Neustart: der Stand kommt aus der Datenbank
+    service.send_due_reminder(_since(cfg) + timedelta(days=20))
+    service.send_due_reminder(_since(cfg) + timedelta(days=21))
+    assert len(sent) == 2 and "Erinnerung 3 von 3" in sent[1][0]
+
+
+def test_reminder_count_survives_restart(setup):
+    cfg, _, sent = setup(REVOKED, **MAIL)
+    SyncService(cfg).run_once()
+    SyncService(cfg).send_due_reminder(_since(cfg) + timedelta(days=3))
+    assert len(sent) == 1
+
+
+def test_failed_mail_is_retried_hourly_and_not_counted(setup, monkeypatch):
+    cfg, _, sent = setup(REVOKED, mail_error=OSError("Connection refused"), **MAIL)
+    service = SyncService(cfg)
+    service.run_once()
+    start = _since(cfg)
+    assert _block(cfg)["reminders"] == 0
+    assert next_reminder(_block(cfg)) == start
+
+    attempts = []
+
+    def send_after_failure(c, subject, body):
+        attempts.append(subject)
+        return "notfall@example.org"
+
+    monkeypatch.setattr(mail, "send", send_after_failure)
+    service.send_due_reminder(start + timedelta(minutes=30))
+    assert attempts == []  # noch innerhalb der Wartezeit
+    service.send_due_reminder(start + timedelta(hours=2))
+    assert len(attempts) == 1 and _block(cfg)["reminders"] == 1
+    assert next_reminder(_block(cfg)) == start + timedelta(days=7)
+
+
+def test_block_from_older_version_continues_with_reminders(setup):
+    cfg, _, sent = setup(**MAIL)
+    since = datetime.now(timezone.utc) - timedelta(days=8)
+    legacy = {"reason": "abgelaufen", "since": since.isoformat(timespec="seconds"),
+              "mail": "Benachrichtigung an notfall@example.org gesendet."}
+    with Storage(cfg.db_path) as s:
+        s.save_settings({"fetch_blocked": json.dumps(legacy)})
+    SyncService(cfg).tick()
+    assert len(sent) == 1 and "Erinnerung 2 von 3" in sent[0][0]
+
+
+def test_block_without_timestamp_sends_nothing(setup):
+    cfg, _, sent = setup(**MAIL)
+    with Storage(cfg.db_path) as s:
+        s.save_settings({"fetch_blocked": "alter Eintrag"})
+    SyncService(cfg).tick()
+    assert sent == []
+
+
+# --- Hintergrund-Thread --------------------------------------------------------
+
+
+def _local(day, hour, minute=0):
+    return datetime(2026, 11, day, hour, minute).astimezone()
+
+
+def test_tick_fetches_only_when_slot_is_reached(setup):
+    cfg, client, _ = setup()
+    service = SyncService(cfg)
+    service.next_run = _local(2, 12)
+    service.tick(_local(2, 11, 59))
+    assert client.calls == []
+    service.tick(_local(2, 12))
+    assert client.calls == ["u1", "u2"]
+    assert service.next_run > datetime.now(timezone.utc)
+
+
+def test_tick_sends_reminders_while_blocked_without_calling_bank(setup):
+    cfg, client, sent = setup(REVOKED, **MAIL)
+    service = SyncService(cfg)
+    service.run_once()
+    calls = list(client.calls)
+    start = _since(cfg)
+    service.next_run = start  # ein alter Zeitpunkt darf die Sperre nicht umgehen
+    service.tick(start + timedelta(days=7))
+    assert client.calls == calls and len(sent) == 2 and service.next_run is None
+
+
+def test_tick_after_reconnect_runs_triggered_fetch_and_plans_again(setup):
+    cfg, client, sent = setup(REVOKED, **MAIL)
+    service = SyncService(cfg)
+    service.run_once()
+    client.calls.clear()
+    client.error = None
+    with Storage(cfg.db_path) as s:
+        clear_block(s)
+    service.trigger()
+    service.tick()
+    assert client.calls == ["u1", "u2"] and not service.busy
+    assert service.next_run is not None and len(sent) == 1
+
+
+def test_trigger_while_blocked_does_not_stay_busy(setup):
+    cfg, client, _ = setup(REVOKED)
+    service = SyncService(cfg)
+    service.run_once()
+    calls = list(client.calls)
+    service.trigger()
+    service.tick()
+    assert not service.busy and client.calls == calls
+
+
+def test_tick_plans_again_when_block_is_cleared_elsewhere(setup):
+    cfg, _, _ = setup(REVOKED)
+    service = SyncService(cfg)
+    service.run_once()
+    assert service.next_run is None
+    with Storage(cfg.db_path) as s:
+        clear_block(s)
+    service.tick()
+    assert service.next_run is not None
+
+
+def test_empty_schedule_means_no_automatic_fetch(setup):
+    cfg, client, _ = setup()
+    with Storage(cfg.db_path) as s:
+        schedule.save(s, {key: [] for key in schedule.DAY_KEYS})
+    service = SyncService(cfg)
+    service.tick()
+    assert service.next_run is None and client.calls == []
+    service.trigger()  # „Jetzt abrufen“ geht trotzdem
+    service.tick()
+    assert client.calls == ["u1", "u2"] and service.next_run is None
+
+
+def test_reschedule_uses_new_plan(setup):
+    cfg, _, _ = setup()
+    service = SyncService(cfg)
+    with Storage(cfg.db_path) as s:
+        schedule.save(s, {key: ["03:15"] for key in schedule.DAY_KEYS})
+    service.reschedule()
+    assert service.next_run.astimezone().strftime("%H:%M") == "03:15"

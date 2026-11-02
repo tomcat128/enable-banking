@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import signal
 import threading
 from datetime import date, datetime, timedelta, timezone
 
-from . import mail, settings
+from . import mail, schedule, settings
 from .client import ApiError, EnableBankingClient
 from .config import Config, ConfigError
 from .storage import Storage, now_iso
@@ -17,6 +18,11 @@ log = logging.getLogger(__name__)
 
 # Wartezeit im run-Modus, solange Einrichtung oder (gültige) Session fehlen.
 NO_SESSION_RETRY = 60
+# So oft prüft der Hintergrund-Thread Abrufzeit und Erinnerungen. Der Vergleich mit der Uhrzeit statt
+# einer langen Wartezeit übersteht auch Zeitumstellung und Ruhezustand des Servers.
+TICK_SECONDS = 30
+# Abstand der Versuche, wenn eine fällige Benachrichtigung nicht versendet werden konnte.
+MAIL_RETRY = timedelta(hours=1)
 
 
 # Fehlercodes der API (Feld "error"), nach denen die Bank eine erneute Anmeldung verlangt.
@@ -51,10 +57,39 @@ def get_block(storage: Storage) -> dict | None:
         return {"reason": raw}
 
 
-def set_block(storage: Storage, reason: str, mail_result: str) -> dict:
-    block = {"reason": reason, "since": now_iso(), "mail": mail_result}
+def set_block(storage: Storage, reason: str) -> dict:
+    block = {"reason": reason, "since": now_iso(), "mail": "", "reminders": 0}
     storage.save_settings({BLOCK_KEY: json.dumps(block, ensure_ascii=False)})
     return block
+
+
+def reminders_sent(block: dict) -> int:
+    """Anzahl der bereits verschickten Benachrichtigungen dieser Sperre."""
+    if "reminders" in block:
+        return block["reminders"]
+    # Sperre aus einer älteren Version, die nur die erste Nachricht kannte.
+    return 1 if str(block.get("mail", "")).startswith("Benachrichtigung an") else 0
+
+
+def due_reminder(block: dict, now: datetime) -> int | None:
+    """Position in REMINDER_DAYS der jetzt fälligen Nachricht, sonst None.
+
+    War die Anwendung länger aus, ist nur die jüngste fällige Nachricht zu versenden, nicht alle.
+    """
+    since = _parse_ts(block.get("since"))
+    if since is None:
+        return None
+    due = [index for index, days in enumerate(mail.REMINDER_DAYS)
+           if index >= reminders_sent(block) and now >= since + timedelta(days=days)]
+    return due[-1] if due else None
+
+
+def next_reminder(block: dict) -> datetime | None:
+    """Zeitpunkt der nächsten Nachricht; None, wenn keine mehr vorgesehen ist."""
+    since, sent = _parse_ts(block.get("since")), reminders_sent(block)
+    if since is None or sent >= len(mail.REMINDER_DAYS):
+        return None
+    return since + timedelta(days=mail.REMINDER_DAYS[sent])
 
 
 def clear_block(storage: Storage) -> bool:
@@ -171,7 +206,7 @@ def sync_all(
 
 
 class SyncService:
-    """Periodischer Abruf im Hintergrund, der sich aus der Weboberfläche anstoßen lässt."""
+    """Abruf nach Zeitplan im Hintergrund, der sich aus der Weboberfläche anstoßen lässt."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -179,6 +214,7 @@ class SyncService:
         self.requested = False
         self.last_error: str | None = None
         self.next_run: datetime | None = None
+        self._mail_retry: datetime | None = None
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -196,10 +232,21 @@ class SyncService:
         self._stop.set()
         self._wake.set()
 
-    def run_once(self) -> float | None:
-        """Führt einen Abruf aus und gibt die Wartezeit bis zum nächsten zurück.
+    def reschedule(self) -> None:
+        """Plant den nächsten Abruf neu, nachdem der Zeitplan geändert wurde."""
+        self.next_run = self._next_slot(datetime.now(timezone.utc))
 
-        None bedeutet: Der Abruf ist gesperrt, bis er in der Weboberfläche freigegeben wird.
+    def _next_slot(self, now: datetime) -> datetime | None:
+        with Storage(self.cfg.db_path) as storage:
+            slot = schedule.next_run(schedule.load(storage), now)
+        if slot:
+            log.info("Nächster Abruf: %s", slot.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+        return slot
+
+    def run_once(self) -> datetime | None:
+        """Führt einen Abruf aus und gibt den Zeitpunkt des nächsten zurück.
+
+        None bedeutet: Der Abruf ist gesperrt oder es ist keine Uhrzeit eingetragen.
         """
         with self._lock:
             self.running, self.requested = True, False
@@ -211,7 +258,7 @@ class SyncService:
                     client = settings.make_client(self.cfg, settings.load(self.cfg, storage))
                     ok = sync_all(client, storage, self.cfg)
                 self.last_error = None if ok else "Abruf für mindestens ein Konto fehlgeschlagen (siehe Konten)."
-                return self.cfg.fetch_interval
+                return self._next_slot(datetime.now(timezone.utc))
             except ReauthRequired as exc:
                 self._block(str(exc))
                 return None
@@ -220,11 +267,11 @@ class SyncService:
                 if str(exc) != self.last_error:
                     log.info("%s", exc)
                 self.last_error = str(exc)
-                return NO_SESSION_RETRY
+                return datetime.now(timezone.utc) + timedelta(seconds=NO_SESSION_RETRY)
             except Exception as exc:
                 log.exception("Abruf fehlgeschlagen")
                 self.last_error = str(exc)
-                return self.cfg.fetch_interval
+                return self._next_slot(datetime.now(timezone.utc))
             finally:
                 self.running = False
 
@@ -233,39 +280,77 @@ class SyncService:
         log.error("%s Der automatische Abruf ist gestoppt, bis die Bank neu verbunden oder der "
                   "Abruf in der Weboberfläche freigegeben wird.", reason)
         self.last_error = None
+        self._mail_retry = None
         with Storage(self.cfg.db_path) as storage:
+            set_block(storage, reason)
+        self.send_due_reminder()
+
+    def send_due_reminder(self, now: datetime | None = None) -> None:
+        """Versendet die fällige Benachrichtigung, solange die Sperre besteht."""
+        now = now or datetime.now(timezone.utc)
+        if self._mail_retry and now < self._mail_retry:
+            return
+        with Storage(self.cfg.db_path) as storage:
+            block = get_block(storage)
+            index = due_reminder(block, now) if block else None
+            if index is None:
+                return
             session = storage.active_session()
             redirect_url = settings.load(self.cfg, storage).redirect_url
         if self.cfg.mail_configured:
-            subject, body = mail.reauth_message(session and session["aspsp_name"], reason,
-                                                mail.public_url(redirect_url))
+            subject, body = mail.reauth_message(
+                session and session["aspsp_name"], block.get("reason", ""), mail.public_url(redirect_url),
+                index, _parse_ts(block.get("since")))
             try:
-                result = f"Benachrichtigung an {mail.send(self.cfg, subject, body)} gesendet."
-                log.info("%s", result)
+                recipients = mail.send(self.cfg, subject, body)
             except mail.MAIL_ERRORS as exc:
-                result = f"Benachrichtigung konnte nicht gesendet werden: {exc}"
-                log.error("%s", result)
+                block["mail"] = f"Benachrichtigung konnte nicht gesendet werden: {exc}"
+                self._mail_retry = now + MAIL_RETRY
+                log.error("%s", block["mail"])
+            else:
+                block["mail"] = (f"Benachrichtigung an {recipients} gesendet." if index == 0 else
+                                 f"Erinnerung {index + 1} von {len(mail.REMINDER_DAYS)} an {recipients} gesendet.")
+                block["reminders"] = index + 1
+                self._mail_retry = None
+                log.info("%s", block["mail"])
         else:
-            result = "Keine Benachrichtigung gesendet, der Mailversand ist nicht eingerichtet."
+            block["mail"] = "Keine Benachrichtigung gesendet, der Mailversand ist nicht eingerichtet."
+            self._mail_retry = now + MAIL_RETRY
+        # Wurde die Bank während des Versands neu verbunden, bleibt die Sperre aufgehoben.
         with Storage(self.cfg.db_path) as storage:
-            set_block(storage, reason, result)
+            storage.update_setting(BLOCK_KEY, json.dumps(block, ensure_ascii=False))
 
-    def initial_delay(self) -> float:
-        """Wartezeit bis zum ersten Abruf nach dem Start.
+    def first_run(self) -> datetime | None:
+        """Erster Abruf nach dem Start.
 
-        Der letzte Abruf steht in der Datenbank im Datenverzeichnis und übersteht damit auch das
-        Neuerstellen von Container und Image. Liegt er weniger als ein Intervall zurück, wird
-        der Rest abgewartet, statt bei jedem Start sofort abzurufen.
+        Wurde noch nie abgerufen, sofort. Sonst gilt der Zeitplan: Ein Neustart oder das Neuerstellen
+        von Container und Image löst keinen zusätzlichen Abruf aus, und eine verpasste Uhrzeit wird
+        nicht nachgeholt, damit nachts und am Wochenende nichts abgerufen wird.
         """
+        now = datetime.now(timezone.utc)
         with Storage(self.cfg.db_path) as storage:
-            last = _parse_ts(storage.last_fetch())
-        if last is None:
-            return 0
-        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
-        return max(0.0, self.cfg.fetch_interval - elapsed)
+            last = storage.last_fetch()
+        return self._next_slot(now) if last else now
+
+    def tick(self, now: datetime | None = None) -> None:
+        """Eine Runde des Hintergrund-Threads: abrufen oder erinnern, falls gerade fällig."""
+        now = now or datetime.now(timezone.utc)
+        if self.requested:
+            self.next_run = self.run_once()
+            return
+        with Storage(self.cfg.db_path) as storage:
+            blocked = get_block(storage) is not None
+        if blocked:
+            self.next_run = None
+            self.send_due_reminder(now)
+            return
+        if self.next_run is None:
+            self.next_run = self._next_slot(now)
+        if self.next_run and now >= self.next_run:
+            self.next_run = self.run_once()
 
     def run_forever(self) -> None:
-        """Ruft in festem Intervall ab, bis SIGTERM/SIGINT empfangen wird."""
+        """Ruft nach Zeitplan ab, bis SIGTERM/SIGINT empfangen wird."""
 
         def _handle(signum, _frame):
             log.info("Signal %s empfangen, beende ...", signal.Signals(signum).name)
@@ -274,20 +359,15 @@ class SyncService:
         signal.signal(signal.SIGTERM, _handle)
         signal.signal(signal.SIGINT, _handle)
 
-        log.info("Starte periodischen Abruf alle %d Sekunden", self.cfg.fetch_interval)
-        delay: float | None = self.initial_delay()
+        if os.environ.get("EB_FETCH_INTERVAL_SECONDS"):
+            log.warning("EB_FETCH_INTERVAL_SECONDS wird nicht mehr verwendet. Die Abrufzeiten stehen "
+                        "in der Weboberfläche unter 'Einstellungen'.")
+        self.next_run = self.first_run()
         while not self._stop.is_set():
-            if delay is None:
-                # Gesperrt: erst nach Freigabe in der Weboberfläche (trigger) weitermachen.
-                self.next_run = None
-                self._wake.wait()
-            elif delay > 0:
-                self.next_run = datetime.now(timezone.utc) + timedelta(seconds=delay)
-                if delay != NO_SESSION_RETRY:
-                    log.info("Nächster Abruf: %s", self.next_run.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
-                self._wake.wait(delay)
+            try:
+                self.tick()
+            except Exception:
+                log.exception("Fehler im Hintergrund-Thread")
+            self._wake.wait(TICK_SECONDS)
             # Ein Anstoß während des laufenden Abrufs bleibt gesetzt und führt sofort zum nächsten.
             self._wake.clear()
-            if self._stop.is_set():
-                break
-            delay = self.run_once()

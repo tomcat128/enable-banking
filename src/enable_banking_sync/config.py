@@ -59,7 +59,6 @@ class Config:
     psu_type: str
     access_days: int
     data_dir: Path
-    fetch_interval: int
     initial_days: int
     overlap_days: int
     web_host: str = "0.0.0.0"
@@ -112,7 +111,6 @@ class Config:
             psu_type=_env("EB_PSU_TYPE", "personal"),
             access_days=_env_int("EB_ACCESS_DAYS", 180),
             data_dir=Path(_env("EB_DATA_DIR", "/data")),
-            fetch_interval=_env_int("EB_FETCH_INTERVAL_SECONDS", 6 * 3600),
             initial_days=_env_int("EB_INITIAL_DAYS", 90),
             overlap_days=_env_int("EB_OVERLAP_DAYS", 10),
             web_host=_env("EB_WEB_HOST", "0.0.0.0"),
